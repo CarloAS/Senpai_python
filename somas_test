@@ -1,0 +1,39 @@
+{
+  "image_path": "/Users/carlos/Desktop/PhD/Code/Senpai_python/results/test_output/test_data.tif",
+  "somas": [
+    [
+      212,
+      363,
+      42,
+      20,
+      2
+    ],
+    [
+      151,
+      14,
+      41,
+      20,
+      2
+    ],
+    [
+      333,
+      47,
+      29,
+      20,
+      2
+    ],
+    [
+      238,
+      320,
+      23,
+      20,
+      2
+    ]
+  ],
+  "num_somas": 4,
+  "image_dimensions": [
+    143,
+    512,
+    512
+  ]
+}
