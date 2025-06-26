@@ -6,11 +6,11 @@ import pickle as pkl
 # Initialize segmentation
 
 config = SegmentationConfig()
-config.size_lim = [512, 512, 149]
+config.size_lim = [1024, 1024, 5]
 config.sigma_gaussian = 0
 
 segmenter = NeuronSegmenter(config)
-orig_img = segmenter.load_image('results/test_output','test_data.tif')
+orig_img = segmenter.load_image('results/test_output','test_neuron_1.tif')
 voxels = segmenter.k_means_voxels()
 
 TOT_KM1 = segmenter.recompose(voxels)
@@ -27,6 +27,6 @@ pkl.dump(refined_seg_2, open('results/test_output/refined_seg_2.pkl', 'wb'))
 segmenter.visualize_segmentation_comparison_xyz(orig_img, refined_seg_1)
 
 separator = NeuronSeparator()
-parcellated_neurons = separator.separate_neurons(refined_seg_1,orig_img,"somas.tif")
+parcellated_neurons = separator.separate_neurons(refined_seg_1,orig_img,"test_neurons_1_somas.tif")
 
 visualize_parcellated_neurons_3d(parcellated_neurons)

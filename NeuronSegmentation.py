@@ -120,19 +120,19 @@ class NeuronSegmenter:
         nyiS = np.maximum(0, nyiL - self.config.safe_margin_xy)
         nyeS = np.minimum(Ny, nyeL + self.config.safe_margin_xy)
         zinit = np.maximum(0, k_seq - self.config.safe_margin)
-        zend = np.minimum(Nz, k_seq + win - self.config.safe_margin)
+        zend = np.minimum(Nz, k_seq + win +self.config.safe_margin)
         NzC = np.minimum(Nz, k_seq + win) - k_seq
         voxels = {}
 
         for i,x in enumerate(nxiL):
             for j,y in enumerate(nyiL):
-                for k in k_seq:
-                    voxels[f'crop_{x}_{y}_{k}'] = {
+                for k,z in enumerate(k_seq):
+                    voxels[f'crop_{x}_{y}_{z}'] = {
                         'nxi': nxiL[i],
                         'nxe': nxeL[i],
                         'nyi': nyiL[j],
                         'nye': nyeL[j],
-                        'k': k,
+                        'k': z,
                         'nxiS': nxiS[i],
                         'nxeS': nxeS[i],
                         'nyiS': nyiS[j],
@@ -321,7 +321,7 @@ class NeuronSegmenter:
         ))
 
         # Initialize TOT_KM1 with proper shape
-        TOT_KM1 = np.ones((NxC, NyC, NzC), dtype=tp)
+        TOT_KM1 = np.ones((NxC, NyC,NzC), dtype=tp)
 
         # Clustering k-means
         kmeans = KMeans(n_clusters=self.config.clusters, n_init=10, max_iter=1000, random_state=42)
@@ -405,7 +405,7 @@ class NeuronSegmenter:
         mask_lv1 = np.zeros((Nx, Ny, Nz), dtype=np.uint8)
         
         # Process each voxel for first level mask
-        for k in range(0, Nz, win):
+        for z in range(0, Nz, win):
             for x in range(0, Nx, size_lim[0]):
                 for y in range(0, Ny, size_lim[1]):
                     # Calculate bounds
@@ -419,7 +419,7 @@ class NeuronSegmenter:
                     Gzz_cl = np.zeros(clusters)
                     
                     # Get current voxel data
-                    voxel_key = f'crop_{x}_{y}_{k}'
+                    voxel_key = f'crop_{x}_{y}_{z}'
                     current_voxel = voxels[voxel_key]
                     
                     # Calculate mean values for each cluster
