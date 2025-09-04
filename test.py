@@ -27,6 +27,6 @@ pkl.dump(refined_seg_2, open('results/test_output/refined_seg_2.pkl', 'wb'))
 segmenter.visualize_segmentation_comparison_xyz(orig_img, refined_seg_1)
 
 separator = NeuronSeparator()
-parcellated_neurons = separator.separate_neurons(refined_seg_1,orig_img,"test_neurons_1_somas.tif")
+parcellated_neurons = separator.separate_neurons(refined_seg_1,orig_img,"test_neurons_1_somas_mask.tif")
 
 visualize_parcellated_neurons_3d(parcellated_neurons)

@@ -405,7 +405,7 @@ class NeuronSegmenter:
         mask_lv1 = np.zeros((Nx, Ny, Nz), dtype=np.uint8)
         
         # Process each voxel for first level mask
-        for z in range(0, Nz, win):
+        for k in range(0, Nz, win):
             for x in range(0, Nx, size_lim[0]):
                 for y in range(0, Ny, size_lim[1]):
                     # Calculate bounds
@@ -419,7 +419,7 @@ class NeuronSegmenter:
                     Gzz_cl = np.zeros(clusters)
                     
                     # Get current voxel data
-                    voxel_key = f'crop_{x}_{y}_{z}'
+                    voxel_key = f'crop_{x}_{y}_{k}'
                     current_voxel = voxels[voxel_key]
                     
                     # Calculate mean values for each cluster
