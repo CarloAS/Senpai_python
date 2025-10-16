@@ -1,2 +1,6 @@
 # Ignore all files in the results directory
 results/
+data/
+.python-version
+.vadis/
+vadis/
