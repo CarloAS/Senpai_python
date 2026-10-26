@@ -5,7 +5,6 @@ import tifffile
 import os
 from scipy import ndimage
 from skimage.filters import gaussian, median
-from skimage.feature import hessian_matrix
 from sklearn.cluster import KMeans
 import pickle
 from pathlib import Path
@@ -22,6 +21,27 @@ class SegmentationConfig:
     safe_margin: int = 3        # Safety margin for overlapping crops
     safe_margin_xy: int = 3     # Safety margin for xy plane
     background_threshold: float = None  # Threshold for background removal
+    min_area: int = 7           # Minimum 2D object area (pixels) kept in the refinement (MATLAB bwpropfilt [7 inf])
+    # Reference intensity R for the thresholds (background 0.02*R, soma fill 0.55*R):
+    #   'max'        -> 2**ceil(log2(image max)), as MATLAB senpai_seg_core_v4 (default)
+    #   'percentile' -> 99.9th percentile of the image (robust to hot pixels)
+    #   int n        -> 2**n, the acquisition bit depth (e.g. 12 for a 12-bit camera stored as uint16; ND2: bitsPerComponentSignificant)
+    #   'dtype'      -> 2**(8 or 16) from the storage type (behaviour before 2026-10-18)
+    intensity_reference: Union[str, int] = 'max'
+
+def _sobel_derivative(vol, axis):
+    """Equivalent of MATLAB imgradientxyz (Sobel, unnormalised, replicate padding) along one array axis."""
+    out = ndimage.correlate1d(vol, [-1, 0, 1], axis=axis, mode='nearest')
+    for ax in range(3):
+        if ax != axis:
+            out = ndimage.correlate1d(out, [1, 2, 1], axis=ax, mode='nearest')
+    return out
+
+
+def second_derivatives(vol):
+    """Gxx, Gyy, Gzz as in senpai_seg_core_v4.m: Sobel gradient of the Sobel gradient along each array axis."""
+    return tuple(_sobel_derivative(_sobel_derivative(vol, ax), ax) for ax in range(3))
+
 
 class NeuronSegmenter:
     """Core class for 3D neuron segmentation from confocal microscopy images"""
@@ -32,6 +52,7 @@ class NeuronSegmenter:
             'dimensions': None,  # (Nx, Ny, Nz)
             'resolution': None,  # (x_res, y_res, z_res)
             'bit_depth': None,
+            'intensity_ref': None,  # reference intensity R, see SegmentationConfig.intensity_reference
             'dtype': None
         }
         self.crops_info = {}
@@ -76,12 +97,28 @@ class NeuronSegmenter:
             self.extract_resolution_info(tif.pages[0].tags)
             
             # Set background threshold based on bit depth
+            self.image_info['intensity_ref'] = self.compute_intensity_reference(img_array)
+            print(f"intensity reference ({self.config.intensity_reference}): {self.image_info['intensity_ref']:.0f}")
             if not self.config.background_threshold:
-                self.config.background_threshold = 0.02 * (2 ** self.image_info['bit_depth'])
+                self.config.background_threshold = 0.02 * self.image_info['intensity_ref']
             
+            self.image_info['dtype'] = img_array.dtype
             self.image_data = img_array.transpose(1, 2, 0)
             img = self.image_data
             return img
+
+    def compute_intensity_reference(self, img_array) -> float:
+        """Reference intensity R used by the background (0.02*R) and soma-fill (0.55*R) thresholds."""
+        ref = self.config.intensity_reference
+        if ref == 'max':
+            return float(2 ** np.ceil(np.log2(max(float(img_array.max()), 1.0))))
+        if ref == 'percentile':
+            return float(np.percentile(img_array, 99.9))
+        if ref == 'dtype':
+            return float(2 ** self.image_info['bit_depth'])
+        if isinstance(ref, (int, np.integer)) and not isinstance(ref, bool):
+            return float(2 ** ref)
+        raise ValueError(f"intensity_reference must be 'max', 'percentile', 'dtype' or an int bit depth, got {ref!r}")
 
     def extract_resolution_info(self, tags) -> None:
         """Extract resolution information from image tags"""
@@ -175,6 +212,7 @@ class NeuronSegmenter:
             TOT_KM1, TOT_KM2 = self.kmeans_clustering(voxel,derivatives)
 
             voxel['TOT_KM1'] = TOT_KM1
+            voxel['TOT_KM2'] = TOT_KM2
 
         return voxels
     
@@ -196,38 +234,31 @@ class NeuronSegmenter:
         # Filtro mediano se sig_G[0] == -1
         if sig_G[0] == -1:
             print('applying 3x3x3 median filter...')
-            cIMc = median(cIMc, size=3)
+            cIMc = ndimage.median_filter(cIMc, size=3)
 
         # Fornisce feedback all'utente
         print(f'1st of {len(sig_G)} passes...')
 
-        # Derivate di primo ordine
+        # Derivate di secondo ordine (Sobel of Sobel, as MATLAB imgradientxyz)
         if sig_G[0] > 0:
-            cIMc_smoothed = gaussian(cIMc.astype(np.float32), 
-                                     sigma=[sig_G[0], sig_G[0] * resolution[0] / resolution[1], sig_G[0] * resolution[0] / resolution[2]])
-            Gx, Gy, Gz = np.gradient(cIMc_smoothed)
+            vol = gaussian(cIMc.astype(np.float32),
+                           sigma=[sig_G[0], sig_G[0] * resolution[0] / resolution[1], sig_G[0] * resolution[0] / resolution[2]])
         else:
-            Gx, Gy, Gz = np.gradient(cIMc.astype(np.float32))
+            vol = cIMc.astype(np.float32)
+        Hxx, Hyy, Hzz = second_derivatives(vol)
 
-        # Derivate di secondo ordine
-        Hxx, Hxy, Hxz, Hyy, Hyz, Hzz = hessian_matrix(cIMc_smoothed if sig_G[0] > 0 else cIMc.astype(np.float32), sigma=1)
-        
-
-        if len(sig_G)>2:
-            cIMc_smoothed = gaussian(cIMc.astype(np.float32), 
-                                     sigma=[sig_G[3], sig_G[3] * resolution[0] / resolution[1], sig_G[0] * resolution[0] / resolution[2]])
-            Gx, Gy, Gz = np.gradient(cIMc_smoothed)
-
-        # Derivate di secondo ordine
-            Hxx_2, Hxy_2, Hxz_2, Hyy_2, Hyz_2, Hzz_2 = hessian_matrix(cIMc_smoothed, sigma=1)
+        if len(sig_G) > 1:
+            vol_2 = gaussian(cIMc.astype(np.float32),
+                             sigma=[sig_G[1], sig_G[1] * resolution[0] / resolution[1], sig_G[1] * resolution[0] / resolution[2]])
+            Hxx_2, Hyy_2, Hzz_2 = second_derivatives(vol_2)
 
         derivatives = {
             'Gxx': Hxx,
             'Gyy': Hyy,
             'Gzz': Hzz,
-            'Gxx_2': None if len(sig_G) <= 2 else Hxx_2,
-            'Gyy_2': None if len(sig_G) <= 2 else Hyy_2,
-            'Gzz_2': None if len(sig_G) <= 2 else Hzz_2
+            'Gxx_2': None if len(sig_G) <= 1 else Hxx_2,
+            'Gyy_2': None if len(sig_G) <= 1 else Hyy_2,
+            'Gzz_2': None if len(sig_G) <= 1 else Hzz_2
         }
 
         return derivatives
@@ -304,12 +335,11 @@ class NeuronSegmenter:
         NxC = voxel['NxC']
         NyC = voxel['NyC']
         NzC = voxel['NzC']
-        tp = self.image_info['dtype']
         GxxKt_2 = voxel['GxxKt_2']
         GyyKt_2 = voxel['GyyKt_2']
         GzzKt_2 = voxel['GzzKt_2']
         mask = cIMc.ravel() >= self.th_back
-        resiz_km = np.ones(len(cIMc.ravel()), dtype=np.uint8)
+        resiz_km = np.zeros(len(cIMc.ravel()), dtype=np.uint8)  # background = lowest class (MATLAB: 1)
 
         print(cIMc.shape)
         # Definisci lo spazio delle caratteristiche per il k-means
@@ -320,19 +350,12 @@ class NeuronSegmenter:
             GzzKt.ravel()[mask]
         ))
 
-        # Initialize TOT_KM1 with proper shape
-        TOT_KM1 = np.ones((NxC, NyC,NzC), dtype=tp)
-
-        # Clustering k-means
-        kmeans = KMeans(n_clusters=self.config.clusters, n_init=10, max_iter=1000, random_state=42)
-        labels = kmeans.fit_predict(km_in1.astype(np.float32))
-        resiz_km[mask] = labels.astype(np.uint8)
-        TOT_KM1 = resiz_km.reshape((NxC, NyC, NzC))
+        TOT_KM1 = self._cluster_features(km_in1, mask, resiz_km, (NxC, NyC, NzC))
 
         TOT_KM2 = None
 
         if GxxKt_2 is not None:
-            resiz_km = np.ones(len(cIMc.ravel()), dtype=np.uint8)
+            resiz_km = np.zeros(len(cIMc.ravel()), dtype=np.uint8)
 
             # Definisci lo spazio delle caratteristiche per il k-means
             km_in1 = np.column_stack((
@@ -342,16 +365,22 @@ class NeuronSegmenter:
                 GzzKt_2.ravel()[mask]
             ))
 
-            # Initialize TOT_KM1 with proper shape
-            TOT_KM2 = np.ones((NxC, NyC, NzC), dtype=tp)
-
-            # Clustering k-means
-            kmeans = KMeans(n_clusters=self.config.clusters, n_init=10, max_iter=1000, random_state=42)
-            labels = kmeans.fit_predict(km_in1.astype(np.float32))
-            resiz_km[mask] = labels.astype(np.uint8)
-            TOT_KM2 = resiz_km.reshape((NxC, NyC, NzC))
+            TOT_KM2 = self._cluster_features(km_in1, mask, resiz_km, (NxC, NyC, NzC))
 
         return TOT_KM1, TOT_KM2
+
+    def _cluster_features(self, km_in, mask, resiz_km, shape):
+        """k-means on the masked voxels; labels 0..K-1 sorted by ascending mean intensity (MATLAB reorderKM).
+        Background voxels (mask False) keep label 0, as MATLAB gives them 1 (the lowest class)."""
+        if km_in.shape[0] >= 10:
+            kmeans = KMeans(n_clusters=self.config.clusters, n_init=10, max_iter=1000, random_state=42)
+            labels = kmeans.fit_predict(km_in.astype(np.float32))
+            means = np.array([km_in[labels == c, 0].mean() if np.any(labels == c) else np.inf
+                              for c in range(self.config.clusters)])
+            rank = np.empty(self.config.clusters, dtype=np.uint8)
+            rank[np.argsort(means)] = np.arange(self.config.clusters, dtype=np.uint8)
+            resiz_km[mask] = rank[labels]
+        return resiz_km.reshape(shape)
 
     def process_segmentation(self, voxels):
         
@@ -382,13 +411,20 @@ class NeuronSegmenter:
             k = voxel['k']
             senpai_KM_lv1[nxi:nxe, nyi:nye, k:k+win] = voxel['TOT_KM1']
             cIM[nxi:nxe, nyi:nye, k:k+win] = voxel['reshaped_cIMc']
-            if len(sig_G) > 2:
+            if len(sig_G) > 1:
                 senpai_KM_lv2[nxi:nxe, nyi:nye, k:k+win] = voxel['TOT_KM2']
 
-        if len(sig_G) <= 2:
+        if len(sig_G) <= 1:
             senpai_KM_lv2 = None
 
         return senpai_KM_lv1, senpai_KM_lv2, cIM
+
+    @staticmethod
+    def _mask_threshold(Gxx_cl, Gyy_cl, Gzz_cl):
+        """MATLAB: find(~(Gxx<0 & Gyy<0 & Gzz<0), 1, 'last') + 1, with 0-based labels. Clusters from this index up are kept.
+        If every cluster has all-negative curvature (MATLAB errors) all clusters are kept."""
+        not_neg = np.where(~((Gxx_cl < 0) & (Gyy_cl < 0) & (Gzz_cl < 0)))[0]
+        return (not_neg[-1] + 1) if len(not_neg) else 0
 
     def compute_neuron_mask(self,senpai_KM_lv1, senpai_KM_lv2, cIM, voxels):
         """
@@ -431,7 +467,7 @@ class NeuronSegmenter:
                             Gzz_cl[clu] = np.mean(current_voxel['GzzKt'][cluster_mask])
                     
                     # Find last index where condition is not met (add 1 for 1-based cluster numbering)
-                    last_index = np.where((Gxx_cl < 0) & (Gyy_cl < 0) & (Gzz_cl < 0) == 0)[0][-1] +1
+                    last_index = self._mask_threshold(Gxx_cl, Gyy_cl, Gzz_cl)
                     
                     # Assign mask values
                     mask_lv1[x:x_end, y:y_end, k:k_end] = last_index
@@ -467,7 +503,7 @@ class NeuronSegmenter:
                                 Gzz_cl[clu] = np.mean(current_voxel['GzzKt_2'][cluster_mask])
                         
                         # Find last index where condition is not met (add 1 for 1-based cluster numbering)
-                        last_index = np.where((Gxx_cl < 0) & (Gyy_cl < 0) & (Gzz_cl < 0) == 0)[0][-1] + 1
+                        last_index = self._mask_threshold(Gxx_cl, Gyy_cl, Gzz_cl)
                         
                         # Assign mask values
                         mask_lv2[x:x_end, y:y_end, k:k_end] = last_index
@@ -498,9 +534,9 @@ class NeuronSegmenter:
         refined_seg_2 : ndarray
             Refined segmentation from level 2 analysis or None
         """
-        bit_depth = self.image_info['bit_depth']
-        # Compute threshold based on bit depth
-        intensity_threshold = 0.55 * (2 ** bit_depth)
+        intensity_ref = self.image_info['intensity_ref']
+        # Soma-fill threshold relative to the reference intensity
+        intensity_threshold = 0.55 * intensity_ref
         
         # Create binary masks based on the cluster indices in mask_lv1
         # The mask_lv1 contains the last index of clusters that don't meet neuron criteria
@@ -513,7 +549,7 @@ class NeuronSegmenter:
                         binary_mask_1[x, y, z] = True
         
         # 3D hole filling on the binary mask
-        filled_seg_1 = self._imfill_3d(binary_mask_1, original_image, bit_depth)
+        filled_seg_1 = self._imfill_3d(binary_mask_1, original_image, intensity_ref)
         
         # Additional segmentation refinement
         refined_seg_1 = np.zeros_like(filled_seg_1, dtype=bool)
@@ -529,6 +565,7 @@ class NeuronSegmenter:
             
             # Remove small artifacts
             slice_cleaned = ndimage.binary_opening(slice_combined)
+            slice_cleaned = self._remove_small_2d(slice_cleaned)
             refined_seg_1[:,:,z] = slice_cleaned
         
         # Apply final 3D morphological operations
@@ -547,7 +584,7 @@ class NeuronSegmenter:
                             binary_mask_2[x, y, z] = True
             
             # 3D hole filling
-            filled_seg_2 = self._imfill_3d(binary_mask_2, original_image, bit_depth)
+            filled_seg_2 = self._imfill_3d(binary_mask_2, original_image, intensity_ref)
             
             # Additional segmentation refinement
             refined_seg_2 = np.zeros_like(filled_seg_2, dtype=bool)
@@ -562,6 +599,7 @@ class NeuronSegmenter:
                 
                 # Remove small artifacts
                 slice_cleaned = ndimage.binary_opening(slice_combined)
+                slice_cleaned = self._remove_small_2d(slice_cleaned)
                 refined_seg_2[:,:,z] = slice_cleaned
             
             # Apply final 3D morphological operations
@@ -569,7 +607,17 @@ class NeuronSegmenter:
         
         return refined_seg_1, refined_seg_2
 
-    def _imfill_3d(self, binary_image, original_image, bit_depth=8):
+    def _remove_small_2d(self, slice_mask):
+        """Drop 2D objects smaller than config.min_area pixels (MATLAB bwpropfilt 'Area' [7 inf], 8-connectivity)."""
+        labeled, n = ndimage.label(slice_mask, structure=np.ones((3, 3)))
+        if n == 0:
+            return slice_mask
+        areas = np.bincount(labeled.ravel())
+        keep = areas >= self.config.min_area
+        keep[0] = False
+        return keep[labeled]
+
+    def _imfill_3d(self, binary_image, original_image, intensity_ref):
         """3D hole filling using scipy.ndimage with intensity thresholding in all dimensions
         
         Parameters:
@@ -578,8 +626,8 @@ class NeuronSegmenter:
             3D binary segmentation image where holes need to be filled
         original_image : ndarray
             Original grayscale image used for thresholding
-        bit_depth : int
-            Bit depth of the original image (default: 8)
+        intensity_ref : float
+            Reference intensity R (see SegmentationConfig.intensity_reference)
             
         Returns:
         --------
@@ -590,7 +638,7 @@ class NeuronSegmenter:
         filled = np.array(binary_image, dtype=bool)
         
         # Calculate intensity threshold
-        threshold = 0.55 * (2 ** bit_depth)
+        threshold = 0.55 * intensity_ref
         
         # Fill holes in each 2D slice along z-axis
         for z in range(binary_image.shape[2]):

@@ -4,3 +4,6 @@ data/
 .python-version
 .vadis/
 vadis/
+matlab_senpai/
+tmp/
+__pycache__/

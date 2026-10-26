@@ -1,14 +1,15 @@
+import h5py  # must be imported before bsb, otherwise h5py fails to initialise HDF5 (RuntimeError H5Tget_class)
 import bsb
 from bsb import Scaffold, Configuration
 import numpy as np
 import os
 
 class BSB_compile:
-    def __init__(self, somas_file=None, morph_file=None, output_file="new_network.hdf5"):
+    def __init__(self, somas_file=None, morph_file=None, output_file="new_network.hdf5", data_path='data/'):
         self.somas_file = somas_file
         self.morph_file = morph_file
         self.output_file = output_file
-        self.data_path = 'data/'
+        self.data_path = data_path  # folder with processed_*.npy, e.g. 'data/<image stem>/'
         self.cell_densities = 2.22*10**(-6)  # cells per um^3
         self.load_data()
 
@@ -38,46 +39,46 @@ class BSB_compile:
         print(f"Metadata extracted: width={self.width_px}, height={self.height_px}, z={self.z_px}, xy_res={self.xy_res}, z_res={self.z_res}")
 
     def load_somas(self):
-        """Load soma coordinates from .npy file."""
+        """Load soma coordinates from .npy file (napari points, (z, y, x) in pixels) and convert to (x, y, z) in um."""
         if self.somas_file:
             try:
-                self.cell_positions = np.load(self.somas_file)
+                points = np.load(self.somas_file)
+                self.cell_positions = points[:, ::-1] * np.array([self.xy_res, self.xy_res, self.z_res])
                 print(f"Soma coordinates loaded from {self.somas_file}")
                 self.placement_strategy = "FixedPositions"
             except Exception as e:
                 print(f"Error loading soma coordinates from {self.somas_file}: {e}")
-                self.placement_strategy = "Random"
+                self.placement_strategy = "RandomPlacement"
         else:
             self.cell_positions = np.empty((0, 3))
-            print("No soma file provided, using empty array.")
+            self.placement_strategy = "RandomPlacement"
+            print("No soma file provided, placing cells randomly.")
 
     def load_morphologies(self):
-        """Load neuron morphologies if provided."""
+        """Register the morphology file (e.g. .swc, in um) used for all cells; enables VoxelIntersection connectivity."""
         if self.morph_file:
-            try:
-                self.morphologies = np.load(self.morph_file, allow_pickle=True)
-                print(f"Morphologies loaded from {self.morph_file}")
-                self.conn_strategy = "VoxelIntersection"
-            except Exception as e:
-                print(f"Error loading morphologies from {self.morph_file}: {e}")
-                self.conn_strategy = "FixedIndegree"
+            self.morph_name = os.path.splitext(os.path.basename(self.morph_file))[0]
+            self.config.morphologies.append(dict(file=self.morph_file, name=self.morph_name))
+            self.conn_strategy = "VoxelIntersection"
+            print(f"Morphology {self.morph_file} registered as '{self.morph_name}'")
         else:
-            self.morphologies = None
+            self.morph_name = None
+            self.conn_strategy = "FixedIndegree"
             print("No morphology file provided.")
 
     def initialize_network(self, conn_strategy=None):
-        """Initialize the BSB network configuration.\nProvide conn_strategy to override default:\n--- AlltoAll, FixedIndegree, FixedOutdegree, VoxelIntersection ---"""
+        """Initialize the BSB network configuration.\nProvide conn_strategy to override default:\n--- AllToAll, FixedIndegree, FixedOutdegree, VoxelIntersection ---"""
         
         bsb.options.verbosity = 3
         config = Configuration.default(storage=dict(engine="hdf5", root=self.output_file))
         config.network.x = self.width_px * self.xy_res
         config.network.y = self.height_px * self.xy_res
         config.network.z = self.z_px * self.z_res
-        self.load_somas
+        self.load_somas()
 
         config.partitions.add("cell_layer", thickness=config.network.z)
 
-        if self.placement_strategy == "Random":
+        if self.placement_strategy == "RandomPlacement":
             volume = config.network.x * config.network.y * config.network.z  # in um^3
             estimated_cells = int(volume * self.cell_densities)
             self.cell_num = estimated_cells
@@ -85,22 +86,19 @@ class BSB_compile:
             self.cell_num = self.cell_positions.shape[0]
         
         config.regions.add("brain_on_chip", type="stack", children=["cell_layer"])
-        config.cell_types.add(
-            "cell_test",
-            spatial=dict(radius=6, count=self.cell_num)
-        )
-
+        self.config = config
         self.load_morphologies()
+        spatial = dict(radius=6, count=self.cell_num)
+        if self.morph_name:
+            spatial["morphologies"] = [self.morph_name]
+        config.cell_types.add("cell_test", spatial=spatial)
         self.conn_strategy = conn_strategy or self.conn_strategy
         print(f"Initialized network with: \n{self.cell_num} cells\nPlacement strategy: {self.placement_strategy}\nConnectivity strategy: {self.conn_strategy}")
-
-        self.config = config
-        
 
 
     def config_network(self):
 
-        if self.placement_strategy == "Random":
+        if self.placement_strategy == "RandomPlacement":
             self.config.placement.add(
                 "place_randomly",
                 strategy=f"bsb.placement.{self.placement_strategy}",
@@ -117,15 +115,15 @@ class BSB_compile:
             )
 
         cases = {
-            "AlltoAll": dict(),
+            "AllToAll": dict(),
             "FixedIndegree": dict(indegree=int(self.cell_num * 0.5)),
             "FixedOutdegree": dict(outdegree=int(self.cell_num * 0.5)),
-            "VoxelIntersection": dict(morphologies=self.morphologies)
+            "VoxelIntersection": dict()
         }  
-        conn_params = cases.get(self.conn_strategy, {})
-        if not conn_params:
+        if self.conn_strategy not in cases:
             print(f"Warning: Unknown connectivity strategy '{self.conn_strategy}'. Defaulting to 'FixedIndegree'.")
-            conn_params = cases["FixedIndegree"]
+            self.conn_strategy = "FixedIndegree"
+        conn_params = cases[self.conn_strategy]
 
         
         self.config.connectivity.add(
@@ -139,8 +137,7 @@ class BSB_compile:
     def build_and_save(self):
         """Build and save the network to the specified HDF5 file."""
         scaffold = Scaffold(self.config)
-        scaffold.build()
-        scaffold.save()
+        scaffold.compile()  # places, connects and saves to the HDF5 file
 
     def plot_network(self):
         """Visualize the network using BSB's built-in plotting."""

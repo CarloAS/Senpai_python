@@ -1,0 +1,17 @@
+{
+  "permissions": {
+    "ask": [
+      "Edit(/data/**)",
+      "Edit(/matlab_senpai/**)",
+      "Edit(/.claude/**)",
+      "Edit(/results/**)",
+      "Bash(sbatch *)",
+      "Bash(scancel *)",
+      "Bash(python -m pip install)",
+      "Bash(pip install)",
+      "Bash(pip install --upgrade)",
+      "Bash(pip3)",
+      "Bash(micromamba)"
+    ]
+  }
+}
