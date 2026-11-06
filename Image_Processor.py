@@ -1,22 +1,36 @@
 import nd2
 import numpy as np
 from skimage.io import imread
-from skimage import filters
+from skimage import filters, measure, segmentation
 import napari
 import tifffile as tiff
 import os
 import argparse
 from magicgui import magicgui
+from magicgui.widgets import Container, PushButton
 from scipy import ndimage
 from skimage.feature import peak_local_max
 from skimage.transform import downscale_local_mean
+from skimage.morphology import remove_small_holes
+
+# Default channel order of Asia's images (Fiji channel N = index N-1); extra channels are named ch<N>
+CHANNEL_NAMES = ['dapi', 'map2', 'actin', 'ki67']
+CHANNEL_COLORMAPS = {'dapi': 'blue', 'map2': 'green', 'actin': 'red', 'ki67': 'gray'}
+SOMA_CHANNEL = 'map2'  # channel used for soma detection in multi-channel TIFFs, unless -c is given
+CELL_CLASSES = ['neuron', 'astrocyte', 'other']  # class codes 0, 1, 2 of detect_cells
+# Accepted neuron ellipsoids = this fraction of the nucleus radius: they are watershed seeds (NeuronSeparator labels mask components),
+# full-size ellipsoids touch in clusters (IF_D14 test: 51 components for 80 neurons at 1.0, 70 at 0.7, 80 at 0.5)
+NEURON_SEED_FRACTION = 0.5
 
 
 def detect_somas(image, xy_res, z_res, radius_um=8.0, voxel_um=1.0, background_um=20.0):
     """Automatic soma proposals: Gaussian smoothing (1 um) minus a large-scale background (Gaussian, background_um;
-    None to skip) -> Otsu threshold -> opening with a ball of 0.6*radius_um -> local maxima of the distance transform.
+    None to skip) -> triangle threshold -> per-slice filling of holes smaller than pi*radius_um^2 -> opening with a ball
+    of 0.6*radius_um -> local maxima of the distance transform.
     The stack is block-averaged to ~voxel_um voxels first. The background subtraction removes uneven illumination,
-    which otherwise makes Otsu select whole bright regions (test_asia: 46% of the volume).
+    which otherwise makes the threshold select whole bright regions (test_asia: 46% of the volume with Otsu).
+    Triangle instead of Otsu keeps dim somas (MAP2 new_asia_test: Otsu keeps 3% of the volume, 19 vs 52 proposals);
+    the hole filling closes nuclear voids of MAP2-stained somas, and is size-limited so neurite loops are not filled.
     image is (Z, Y, X); returns an (N, 4) array [z, y, x, r]: centre in pixels of `image` and the distance-transform
     value at the peak in um (~ soma radius), sorted by r (largest first)."""
     fz = max(1, int(round(voxel_um / z_res)))
@@ -26,7 +40,9 @@ def detect_somas(image, xy_res, z_res, radius_um=8.0, voxel_um=1.0, background_u
     smooth = ndimage.gaussian_filter(small, 1.0 / res)
     if background_um:
         smooth -= ndimage.gaussian_filter(small, background_um / res)
-    fg = smooth > filters.threshold_otsu(smooth)
+    fg = smooth > filters.threshold_triangle(smooth)
+    max_hole = int(np.pi * radius_um**2 / (res[1] * res[2]))
+    fg = np.stack([remove_small_holes(s, area_threshold=max_hole) for s in fg])
     # Opening with a Euclidean ball (erosion then dilation), done with distance transforms: much faster than binary_opening
     r_open = 0.6 * radius_um
     core = ndimage.distance_transform_edt(fg, sampling=res) > r_open
@@ -42,6 +58,55 @@ def detect_somas(image, xy_res, z_res, radius_um=8.0, voxel_um=1.0, background_u
     return np.column_stack([centres, r[order]])
 
 
+def detect_cells(channels, xy_res, z_res, voxel_um=0.5, background_um=20.0, min_radius_um=2.5, shell_um=(0.5, 3.0),
+                 map2_min=5.0, actin_min=5.0, ki67_min=10.0):
+    """Cell proposals from a multi-channel stack (channels: {name: (Z, Y, X)}, needs 'dapi' and 'map2'; 'actin', 'ki67' optional).
+    Nuclei: DAPI block-averaged to ~voxel_um in XY, Gaussian 0.7 um minus Gaussian background_um, Otsu, seeds = maxima of DAPI
+    smoothed at 1.5 um (min distance 2.5 um), watershed; nuclei with equivalent radius < min_radius_um are dropped (debris).
+    Each channel is expressed as a robust z-score ((value - median) / (1.4826 MAD) of its background-subtracted image).
+    Per nucleus: MAP2 and F-actin mean in a shell shell_um outside the nucleus (excluding DAPI foreground), Ki67 mean inside.
+    Class: neuron if MAP2 shell > map2_min, else astrocyte if F-actin shell > actin_min, else other; Ki67+ if Ki67 > ki67_min.
+    MAP2 is measured in the shell, not as a shell/inside ratio: in 3D the axial blur fills the nuclear void with cytoplasm.
+    Returns (N, 9): [z, y, x, r_um, class, ki67_pos, map2_shell, actin_shell, ki67_in], z/y/x in pixels of the full stack."""
+    fxy = max(1, int(round(voxel_um / xy_res)))
+    res = np.array([z_res, xy_res * fxy, xy_res * fxy])
+    raw, zscore = {}, {}
+    for name in ('dapi', 'map2', 'actin', 'ki67'):
+        if name not in channels:
+            continue
+        raw[name] = downscale_local_mean(np.asarray(channels[name], dtype=np.float32), (1, fxy, fxy))
+        bg_sub = ndimage.gaussian_filter(raw[name], 0.7 / res) - ndimage.gaussian_filter(raw[name], background_um / res)
+        med = np.median(bg_sub)
+        zscore[name] = (bg_sub - med) / (1.4826 * np.median(np.abs(bg_sub - med)))
+
+    fg = zscore['dapi'] > filters.threshold_otsu(zscore['dapi'])
+    blob = ndimage.gaussian_filter(raw['dapi'], 1.5 / res)  # one maximum per nucleus
+    seeds = peak_local_max(blob, min_distance=int(round(2.5 / res[1])), labels=fg.astype(int), exclude_border=False)
+    markers = np.zeros(fg.shape, int)
+    markers[tuple(seeds.T)] = np.arange(1, len(seeds) + 1)
+    nuclei = segmentation.watershed(-blob, markers, mask=fg)
+
+    rows = []
+    pad = np.ceil(shell_um[1] / res).astype(int) + 1
+    for p in measure.regionprops(nuclei):
+        r = (3 * p.area * res.prod() / (4 * np.pi)) ** (1 / 3)
+        if r < min_radius_um:
+            continue
+        box = tuple(slice(max(0, a - q), b + q) for a, b, q in zip(p.bbox[:3], p.bbox[3:], pad))
+        nuc = nuclei[box] == p.label
+        dist = ndimage.distance_transform_edt(~nuc, sampling=res)
+        shell = (dist > shell_um[0]) & (dist <= shell_um[1]) & ~fg[box]
+        inner = ndimage.distance_transform_edt(nuc, sampling=res) > 1.0
+        if inner.sum() < 5:
+            inner = nuc
+        mean = lambda name, region: zscore[name][box][region].mean() if name in zscore and region.any() else np.nan
+        map2, actin, ki67 = mean('map2', shell), mean('actin', shell), mean('ki67', inner)
+        cls = 0 if map2 > map2_min else 1 if actin > actin_min else 2
+        z, y, x = p.centroid
+        rows.append([z, (y + 0.5) * fxy - 0.5, (x + 0.5) * fxy - 0.5, r, cls, float(ki67 > ki67_min), map2, actin, ki67])
+    return np.array(rows).reshape(-1, 9)
+
+
 class ImageProcessor:
     def __init__(self, image_path = None, data_path='data/', channel=None):
         
@@ -49,11 +114,15 @@ class ImageProcessor:
         self.channel = channel
         self.file_save = 'somas_data.npy'
         self.image_path = image_path
+        self.channels = None  # {name: (Z, Y, X) array} for multi-channel TIFFs
+        self.channel_names = None
         self.folder_save = os.path.join(data_path, image_path.split('.')[0])
+        self.astrocytes_file = os.path.join(self.folder_save, 'astrocytes_data.npy')
         self.check = self.check_already_processed()
         self.read_image(image_path)
         self.data_folder()
         self.auto_somas = self.load_or_detect_somas()
+        self.auto_cells = self.load_or_detect_cells() if self.channels else None
 
         # Napari viewer defaults
         self.processed_image = None
@@ -75,14 +144,30 @@ class ImageProcessor:
             somas = np.load(auto_file)
             print(f"Loaded {len(somas)} automatic soma proposals from {auto_file}")
             return somas
-        print("Running automatic soma detection (background-subtracted Otsu + opening + distance-transform peaks, r=8 um)...")
+        print("Running automatic soma detection (background-subtracted triangle threshold + small-hole fill + opening + distance-transform peaks, r=8 um)...")
         somas = detect_somas(self.image_data, self.xy_res, self.z_res)
         np.save(auto_file, somas)
         print(f"Saved {len(somas)} automatic soma proposals to {auto_file}")
         return somas
 
+    def load_or_detect_cells(self):
+        """Load the DAPI/MAP2/F-actin/Ki67 cell proposals, or run detect_cells once and save them to auto_cells.npy."""
+        auto_file = os.path.join(self.folder_save, 'auto_cells.npy')
+        if os.path.exists(auto_file):
+            cells = np.load(auto_file)
+            print(f"Loaded {len(cells)} automatic cell proposals from {auto_file}")
+        else:
+            print("Running automatic cell detection (DAPI nuclei, classified by MAP2 / F-actin around them, Ki67 inside)...")
+            cells = detect_cells(self.channels, self.xy_res, self.z_res)
+            np.save(auto_file, cells)
+            print(f"Saved {len(cells)} automatic cell proposals to {auto_file}")
+        counts = ', '.join(f"{np.sum(cells[:, 4] == i)} {c}" for i, c in enumerate(CELL_CLASSES))
+        print(f"  {counts}; {int(cells[:, 5].sum())} Ki67+")
+        return cells
+
     def read_image(self, image_path):
-        if self.check == True:
+        # Multi-channel TIFFs are re-read: only the soma channel is cached in processed_image.npy
+        if self.check == True and not self.channel_names:
             return
         if image_path.endswith('.tif'):
             self.tiff_preprocess()
@@ -103,6 +188,9 @@ class ImageProcessor:
             self.z_px = metadata['z_px']
             self.xy_res = metadata['xy_res']
             self.z_res = metadata['z_res']
+            self.channel_names = metadata.get('channel_names')
+            if self.channel is None:
+                self.channel = metadata.get('channel')
             print("Loaded previously processed image and metadata.")
             if os.path.exists(os.path.join(self.folder_save, self.file_save)):
                 print("Found previously saved soma coordinates.")
@@ -115,24 +203,26 @@ class ImageProcessor:
     def tiff_preprocess(self):
         self.img_path_full = os.path.join(self.data_path, 'imgs', self.image_path)
         with tiff.TiffFile(self.img_path_full) as tif:
-            page = tif.pages[0]
-            tags = page.tags
-
-            Img_width = tags.get("ImageWidth")
-            Img_length = tags.get("ImageLength")
-            Img_Description = tags.get("ImageDescription")
-            XYRes = tags.get("XResolution")
-
-            Img_Description.value.split("\n")
-            slices = int([line.split("=")[1] for line in Img_Description.value.split("\n") if line.startswith("images=")][0])
-            spacing = float([line.split("=")[1] for line in Img_Description.value.split("\n") if line.startswith("spacing=")][0])
-            
+            series = tif.series[0]
+            XYRes = tif.pages[0].tags.get("XResolution")
             self.xy_res = XYRes.value[1] / XYRes.value[0]  # µm/pixel
-            self.z_res = spacing # µm/pixel in Z
-            self.width_px = Img_width.value
-            self.height_px = Img_length.value
-            self.z_px = slices
-            self.image_data = tif.asarray()
+            # ImageJ omits "spacing=" when the voxel depth is 1.0
+            self.z_res = float((tif.imagej_metadata or {}).get('spacing', 1.0))  # µm/pixel in Z
+            image_data = series.asarray()
+
+        if 'C' in series.axes:
+            # Hyperstack (Z, C, Y, X): keep every channel, use one of them (MAP2 by default) for the somas
+            image_data = np.moveaxis(image_data, series.axes.index('C'), 0)
+            names = [CHANNEL_NAMES[c] if c < len(CHANNEL_NAMES) else f'ch{c + 1}' for c in range(len(image_data))]
+            self.channels = dict(zip(names, image_data))
+            self.channel_names = names
+            if self.channel is None:
+                self.channel = names.index(SOMA_CHANNEL)
+            print(f"Channels: {', '.join(f'{i}={n}' for i, n in enumerate(names))}; somas on channel {self.channel} ({names[self.channel]})")
+            image_data = image_data[self.channel]
+
+        self.image_data = image_data
+        self.z_px, self.height_px, self.width_px = image_data.shape
 
     def nd2_preprocess(self):
         self.img_path_full = os.path.join(self.data_path, 'imgs', self.image_path)
@@ -194,9 +284,14 @@ class ImageProcessor:
             self.shapes_layer.remove(list(range(length_shapes - len(self.z_radius_list), length_shapes)))  # Clear last shape
             
         # Add an ellipsoid around the last added point
-        center_point = points[-1]
-        z_radius = np.arange(-self.z_radius, self.z_radius+1)
-        x_radius = [int(self.xy_radius * np.sqrt(1 - (z / self.z_radius) ** 2)) for z in z_radius]
+        self._add_ellipsoid(points[-1], self.xy_radius, self.z_radius)
+
+        print(len(self.shapes_layer.data))
+
+    def _add_ellipsoid(self, center_point, xy_radius, z_radius_max):
+        """Add one 2D ellipse per z-slice (z = center +- z_radius_max) to the shapes layer: a soma ellipsoid."""
+        z_radius = np.arange(-z_radius_max, z_radius_max+1)
+        x_radius = [int(xy_radius * np.sqrt(1 - (z / z_radius_max) ** 2)) for z in z_radius]
         self.x_radius_list = x_radius
         self.z_radius_list = z_radius
         for x, z in zip(x_radius, z_radius):
@@ -207,8 +302,6 @@ class ImageProcessor:
                 [center_point[0] + z, center_point[1] - x, center_point[2] - x],
             ])
             self.shapes_layer.add(bounding_box, shape_type='ellipse')
-
-        print(len(self.shapes_layer.data))
 
     @magicgui(
             layout="vertical",
@@ -257,12 +350,51 @@ class ImageProcessor:
 
     def open_viewer(self):
         self.viewer = napari.Viewer()
-        self.viewer.add_image(self.image_data)
+        if self.channels:
+            for name, data in self.channels.items():
+                self.viewer.add_image(data, name=name, colormap=CHANNEL_COLORMAPS.get(name, 'gray'), blending='additive',
+                                      visible=name in ('dapi', self.channel_names[self.channel]))
+        else:
+            self.viewer.add_image(self.image_data)
+        self.cell_layers = {}  # 0 neuron, 1 astrocyte, 2 other, 3 proliferating -> editable points layer (select / move / delete with napari's own tools)
+        single_channel = self.auto_cells is None
         if len(self.auto_somas):
             # Proposals only (not saved as somas); added before 'Soma Centroids' so clicks still go to the manual layer
-            self.viewer.add_points(self.auto_somas[:, :3], name='Auto Somas (proposed)', ndim=3,
-                                   size=2 * self.auto_somas[:, 3] / self.xy_res, face_color='transparent',
-                                   border_color='yellow', opacity=0.8)
+            auto_layer = self.viewer.add_points(self.auto_somas[:, :3], name='Auto Somas (proposed)', ndim=3,
+                                                size=2 * self.auto_somas[:, 3] / self.xy_res, face_color='transparent',
+                                                border_color='yellow', opacity=0.8, visible=single_channel,
+                                                out_of_slice_display=single_channel)
+            if single_channel:
+                # Without the multi-channel classes these are the neuron proposals: editable and accepted with 'Accept neuron somas'
+                auto_layer.current_size = np.median(auto_layer.size)
+                self.cell_layers[0] = auto_layer
+        if self.auto_cells is not None:
+            # One layer per group (DAPI nuclei): Ki67+ cells form their own group whatever their MAP2 / F-actin class;
+            # hovering shows the class and the measured z-scores
+            ki67 = self.auto_cells[:, 5] == 1
+            groups = [('Neuron somas', 'yellow', (self.auto_cells[:, 4] == 0) & ~ki67),
+                      ('Astrocyte somas', 'magenta', (self.auto_cells[:, 4] == 1) & ~ki67),
+                      ('Other nuclei', 'white', (self.auto_cells[:, 4] == 2) & ~ki67),
+                      ('Proliferating (Ki67+) cells', 'cyan', ki67)]
+            for i, (name, color, selected) in enumerate(groups):
+                cells = self.auto_cells[selected]
+                kwargs = dict(name=f'{name} (proposed)', border_color=color,
+                              features={'class': [CELL_CLASSES[int(k)] for k in cells[:, 4]], 'map2_shell': cells[:, 6],
+                                        'actin_shell': cells[:, 7], 'ki67_in': cells[:, 8]})
+                if i == 1 and os.path.exists(self.astrocytes_file):
+                    cells = np.load(self.astrocytes_file)  # previously accepted astrocytes [z, y, x, r_um]
+                    kwargs = dict(name=f'{name} (accepted)', border_color=color)
+                if len(cells) == 0:
+                    continue
+                self.cell_layers[i] = self.viewer.add_points(cells[:, :3], ndim=3, size=2 * cells[:, 3] / self.xy_res,
+                                                             face_color='transparent', border_width=0.15, opacity=0.8,
+                                                             visible=i != 2, out_of_slice_display=True, **kwargs)
+                self.cell_layers[i].current_size = np.median(self.cell_layers[i].size)  # size of points added by hand
+        if self.cell_layers:
+            # out_of_slice_display uses the size in pixels (~75) as z extent, i.e. every slice: limit it to the nucleus' slices
+            self.viewer.dims.events.current_step.connect(self._show_cells_near_slice)
+            self.viewer.dims.events.ndisplay.connect(self._show_cells_near_slice)
+            self._show_cells_near_slice()
 
         self.points_layer = self.viewer.add_points(name='Soma Centroids', face_color='magenta', size=5, ndim=3)
         self.points_layer.events.data.connect(self._on_point_added)
@@ -272,6 +404,15 @@ class ImageProcessor:
         self.viewer.window.add_dock_widget(self._slider_widget, name="Soma Controls", area='right')
         self.viewer.window.add_dock_widget(self._undo_widget, name="Undo Soma", area='right')
         self.viewer.window.add_dock_widget(self._save_widget, name="Save Somas", area='right')
+        if self.cell_layers:
+            actions = {'Accept neuron somas': self.accept_neurons, 'Accept astrocytes': self.accept_astrocytes,
+                       'Discard other nuclei': self.discard_other_nuclei}
+            if single_channel:
+                actions = {'Accept neuron somas': self.accept_neurons}
+            buttons = [PushButton(text=text) for text in actions]
+            for button, action in zip(buttons, actions.values()):
+                button.clicked.connect(action)
+            self.viewer.window.add_dock_widget(Container(widgets=buttons), name="Cell Proposals", area='right')
         if self.check == True:
             self.viewer.window.add_dock_widget(self._load_widget, name="Load Somas", area='right')
         self._load_widget.load_button.clicked.connect(self.load_somas_data)
@@ -292,11 +433,63 @@ class ImageProcessor:
     def undo_soma(self):
         if len(self.points_layer.data) > 0:
             #self.points_layer.events.data.disconnect(self._on_point_added)
+            last = self.points_layer.data[-1]
             self.points_layer.remove(list(range(len(self.points_layer.data) - 1, len(self.points_layer.data))))
-            self.shapes_layer.remove(list(range(len(self.shapes_layer.data) - len(self.z_radius_list), len(self.shapes_layer.data))))
+            # The soma's ellipses are the shapes centred on its (y, x)
+            own = [i for i, c in enumerate(self.shapes_layer.data) if np.allclose(c[:, 1:].mean(axis=0), last[1:], atol=0.5)]
+            self.shapes_layer.remove(own)
             #self.points_layer.events.data.connect(self._on_point_added)
         else:
             print("No soma points to undo.")
+
+    def _show_cells_near_slice(self, event=None):
+        """Show each cell proposal only on the slices its nucleus covers (centre +- radius in um / z_res); all of them in 3D."""
+        z = self.viewer.dims.current_step[0]
+        for layer in self.cell_layers.values():
+            if self.viewer.dims.ndisplay == 3:
+                layer.shown = np.ones(len(layer.data), bool)
+            else:
+                z_extent = np.asarray(layer.size) / 2 * self.xy_res / self.z_res
+                layer.shown = np.abs(layer.data[:, 0] - z) <= z_extent
+
+    def accept_neurons(self):
+        """Copy the (edited) neuron proposals into 'Soma Centroids', each with an ellipsoid of NEURON_SEED_FRACTION times its point's
+        radius (the detected nucleus radius; the median one for points added by hand), then remove the proposal layer.
+        Proposals inside an existing soma (e.g. after Load Somas) are skipped. Save Somas writes them as usual."""
+        layer = self.cell_layers.pop(0, None)
+        if layer is None:
+            print("No neuron proposals to accept.")
+            return
+        existing = np.array(self.points_layer.data)
+        self.points_layer.events.data.disconnect(self._on_point_added)  # ellipsoids are added here with their own radius
+        added = 0
+        for center, size in zip(np.round(layer.data), layer.size):
+            xy_r = NEURON_SEED_FRACTION * size / 2
+            z_r = max(1, int(round(xy_r * self.xy_res / self.z_res)))
+            if len(existing) and np.any((np.hypot(*(existing[:, 1:] - center[1:]).T) < xy_r) & (np.abs(existing[:, 0] - center[0]) <= z_r)):
+                continue
+            self.points_layer.add(center)
+            self._add_ellipsoid(center, xy_r, z_r)
+            added += 1
+        self.points_layer.events.data.connect(self._on_point_added)
+        self.viewer.layers.remove(layer)
+        print(f"Accepted {added} neuron somas ({len(layer.data) - added} skipped: already marked). Press 'Save Somas' to save them.")
+
+    def accept_astrocytes(self):
+        """Save the (edited) astrocyte proposals to astrocytes_data.npy ([z, y, x, r_um], pixel coords); press again to re-save."""
+        layer = self.cell_layers.get(1)
+        if layer is None:
+            print("No astrocyte proposals to accept.")
+            return
+        np.save(self.astrocytes_file, np.column_stack([layer.data, np.asarray(layer.size) / 2 * self.xy_res]))
+        layer.name = 'Astrocyte somas (accepted)'
+        print(f"Saved {len(layer.data)} astrocytes to {self.astrocytes_file}")
+
+    def discard_other_nuclei(self):
+        """Remove the 'other nuclei' proposals from the viewer (auto_cells.npy is kept)."""
+        layer = self.cell_layers.pop(2, None)
+        if layer is not None:
+            self.viewer.layers.remove(layer)
 
     def load_somas_data(self):
         self.points_layer.data = self.points_layer_data
@@ -335,6 +528,7 @@ class ImageProcessor:
             'file_save': self.file_save,
             'data_path': self.data_path,
             'channel': self.channel,
+            'channel_names': self.channel_names,
             'width_px': self.width_px,
             'height_px': self.height_px,
             'z_px': self.z_px,
@@ -363,8 +557,8 @@ def main():
     parser.add_argument(
         "-c", "--channel",
         type=int,
-        default=0,
-        help="Channel index to load for multi-channel images (default: 0)."
+        default=None,
+        help="Channel index (0-based) used for the somas: required for .nd2; multi-channel .tif default: MAP2 (index 1)."
     )
     parser.add_argument(
         "-d", "--data-path",

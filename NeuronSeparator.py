@@ -4,6 +4,8 @@ import skimage.segmentation
 # import skimage.measure # Not strictly needed if using scipy.ndimage.label and .sum_labels
 from skimage.io import imread # Added for TIFF reading
 from skimage import measure # Explicitly kept for marching_cubes in visualization
+from skimage import filters
+from skimage.morphology import reconstruction
 import json # No longer needed for soma loading by NeuronSeparator, but kept if other parts of a larger project use it
 from pathlib import Path
 import matplotlib.pyplot as plt
@@ -69,9 +71,40 @@ class NeuronSeparator:
 
         return somas_binary_mask
 
+    @staticmethod
+    def _grow_seeds_in_cell_body(labeled_somas, original_image, resolution, grow_um, tile=512):
+        """Grow each labelled seed by up to grow_um (anisotropic distance, labels do not overlap: expand_labels) inside the
+        cell body = image smoothed with a 1 um Gaussian, with dark holes filled per z-slice (grayscale reconstruction: the nucleus
+        of a MAP2 soma), above its Otsu threshold. Done in XY tiles with a grow_um margin to keep memory low."""
+        res = np.asarray(resolution, dtype=float)
+        smooth = scipy.ndimage.gaussian_filter(original_image.astype(np.float32), 1.0 / res)
+        for z in range(smooth.shape[2]):
+            slice_z = smooth[:, :, z]
+            seed = slice_z.copy()
+            seed[1:-1, 1:-1] = slice_z.max()
+            smooth[:, :, z] = reconstruction(seed, slice_z, method='erosion')
+        body = smooth > filters.threshold_otsu(smooth)
+        del smooth
+
+        grown = np.zeros_like(labeled_somas)
+        margin = int(np.ceil(grow_um / min(res[0], res[1]))) + 1
+        nx, ny = labeled_somas.shape[:2]
+        for x0 in range(0, nx, tile):
+            for y0 in range(0, ny, tile):
+                xs, ys = slice(max(0, x0 - margin), min(nx, x0 + tile + margin)), slice(max(0, y0 - margin), min(ny, y0 + tile + margin))
+                part = labeled_somas[xs, ys]
+                if not part.any():
+                    continue
+                expanded = skimage.segmentation.expand_labels(part, distance=grow_um, spacing=res)
+                cx, cy = x0 - xs.start, y0 - ys.start
+                grown[x0:x0 + tile, y0:y0 + tile] = expanded[cx:cx + tile, cy:cy + tile]
+        grown *= body
+        grown[labeled_somas > 0] = labeled_somas[labeled_somas > 0]  # the seed itself always stays
+        return grown
+
     def separate_neurons(self, binary_segmentation: np.ndarray,
                          original_image: np.ndarray,
-                         soma_mask_path: str) -> np.ndarray:
+                         soma_mask_path: str, resolution=None, soma_grow_um: float = 6.0) -> np.ndarray:
         """
         Separates neurons using watershed guided by soma locations from a TIFF mask.
 
@@ -81,6 +114,10 @@ class NeuronSeparator:
             original_image (np.ndarray): The original intensity image. Shape (Nx, Ny, Nz).
             soma_mask_path (str): Path to the TIFF file containing the soma binary mask.
                                    The mask should have the same dimensions as the original_image.
+            resolution (tuple): (x, y, z) voxel size in um. If given (not in MATLAB), each soma seed is grown by up to
+                                soma_grow_um inside the cell body (see _grow_seeds_in_cell_body) and added to the segmentation,
+                                so small seeds in a dark nucleus (MAP2) claim their own soma. None: MATLAB behaviour.
+            soma_grow_um (float): maximum growth of the seeds, in um.
 
         Returns:
             np.ndarray: Label matrix (dtype=np.uint16) where each unique integer
@@ -116,6 +153,13 @@ class NeuronSeparator:
              return None
         print(f"Found {num_soma_labels} distinct soma markers.")
 
+        if resolution is not None:
+            # MAP2: the seeds lie in the dark nucleus, outside the segmentation (which misses most soma cytoplasm), and lose
+            # their own soma to neighbours flooding through bright tissue. Grown seeds cover the soma and are part of the neuron.
+            print(f'Growing soma seeds by up to {soma_grow_um} um inside the cell body...')
+            labeled_somas = self._grow_seeds_in_cell_body(labeled_somas, original_image, resolution, soma_grow_um)
+            senpai_seg |= labeled_somas > 0
+
         print('Filtering image and preparing for watershed...')
         # Median filter is applied to the original image, similar to medfilt3 in MATLAB
         filtered_image = scipy.ndimage.median_filter(original_image, size=3)
@@ -133,17 +177,20 @@ class NeuronSeparator:
 
         # The imimposemin equivalent is handled by using `labeled_somas` as markers in watershed.
 
+        # As MATLAB: cIM_inv(~senpai_seg)=db, watershed on the whole image, then parcel_final=ww.*senpai_seg.
+        # (Watershed restricted with mask=senpai_seg dropped every seed lying outside the segmentation, e.g. in a nuclear hole.)
+        image_for_watershed[~senpai_seg] = image_max_intensity
+
         watershed_conn = scipy.ndimage.generate_binary_structure(3, 1) # Connectivity for watershed expansion
         print('Performing watershed...')
         watershed_result = skimage.segmentation.watershed(
             image_for_watershed,
             markers=labeled_somas,
-            mask=senpai_seg,
             connectivity=watershed_conn, # Defines neighborhood for watershed algorithm
             watershed_line=False # Keeps watershed lines as part of labeled regions if True; False merges them.
                                  # For neuron separation, False is usually desired.
         )
-        parcel_final = watershed_result.astype(np.uint16) # Cast to uint16 like in MATLAB
+        parcel_final = (watershed_result * senpai_seg).astype(np.uint16) # Cast to uint16 like in MATLAB
 
         print('Pruning non-connected branches...')
         unique_labels = np.unique(parcel_final)
@@ -176,8 +223,29 @@ class NeuronSeparator:
                 pixels_to_remove_mask = (labeled_components != largest_component_label_in_hist) & (labeled_components != 0)
                 parcel_final[pixels_to_remove_mask] = 0 # Set smaller components to background
         
+        if resolution is not None:
+            # MAP2: away from the seed's centre slices, a soma can still enclose its (dark, unsegmented) nucleus as a hole
+            parcel_final = self._fill_holes_per_label(parcel_final, resolution, max_hole_um2=np.pi * (2 * soma_grow_um) ** 2)
+
         print('Done!')
         return parcel_final
+
+    @staticmethod
+    def _fill_holes_per_label(labels, resolution, max_hole_um2):
+        """Per z-slice, fill background holes enclosed by a single label, if smaller than max_hole_um2 (nucleus, not neurite loops)."""
+        max_hole_px = max_hole_um2 / (resolution[0] * resolution[1])
+        for label_val, box in enumerate(scipy.ndimage.find_objects(labels), start=1):
+            if box is None:
+                continue
+            sub = labels[box]
+            for z in range(sub.shape[2]):
+                own = sub[:, :, z] == label_val
+                holes, n_holes = scipy.ndimage.label(scipy.ndimage.binary_fill_holes(own) & (sub[:, :, z] == 0))
+                if n_holes:
+                    areas = np.bincount(holes.ravel())
+                    small = np.nonzero(areas[1:] <= max_hole_px)[0] + 1
+                    sub[:, :, z][np.isin(holes, small)] = label_val
+        return labels
 
 
 def visualize_parcellated_neurons_3d(

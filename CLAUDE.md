@@ -22,6 +22,14 @@ Do not edit them. When changing a Python port, compare against its MATLAB source
 | `senpai_estimateK.m`, `senpai_skeletonize.m`, `senpai_strahlerord.m`, `senpai_spinecatch.m` | none | not ported |
 
 ## Pipeline (run from the folder containing the data, all paths are relative to the working directory)
+0. Multi-channel ImageJ TIFFs (Z, C, Y, X, e.g. `data/imgs/IF_D14_ID_40x_3petri_middle_Ch2_.tif`, 5 channels) are read directly by
+   `Image_Processor.py` (no split files, user decision 2026-11-05): `tiff_preprocess` keeps all channels in `self.channels`
+   (names from `CHANNEL_NAMES`, Fiji order, extra channels `ch<N>`), `self.image_data` = the soma channel (`-c`, 0-based; default `SOMA_CHANNEL`
+   = map2 = index 1), napari shows every channel as an additive layer (dapi + soma channel visible). `processed_image.npy` caches only the soma
+   channel; multi-channel TIFFs are always re-read (metadata stores `channel_names`). `.nd2` now needs `-c` (CLI default changed 0 → None).
+   Verified headless 2026-11-05: soma channel pixel-identical to `data/imgs/map2_asia_test.tif` (the earlier Fiji MAP2 export, formerly
+   `new_asia_test.tif`), same 52 proposals (written to `data/IF_D14_ID_40x_3petri_middle_Ch2_/auto_somas.npy`); single-channel TIFFs still load
+   (`test_asia.tif` 0.3532/0.5 µm). Napari layers not tested (no OpenGL).
 1. Soma marking, one of:
    - `python Image_Processor.py -i FILE.{tif,nd2} -c CHANNEL -d data/` (napari, newest). Reads
      `data/imgs/FILE`, writes to `data/<FILE stem>/`: `processed_image.npy`, `processed_metadata.npy`
@@ -34,15 +42,65 @@ Do not edit them. When changing a Python port, compare against its MATLAB source
      Shown in napari as the yellow `Auto Somas (proposed)` points layer (added below `Soma Centroids`, so clicks still go to the manual layer);
      they are NOT copied into `somas_data.npy` or the soma mask. Cached: delete `auto_somas.npy` to re-run after changing parameters.
      `detect_somas(image, xy_res, z_res, radius_um=8, voxel_um=1, background_um=20)`: block-average to ~1 µm voxels → Gaussian 1 µm minus
-     Gaussian 20 µm (background removal) → Otsu → opening with a 0.6·r ball (done with distance transforms) → EDT peaks (min distance 1.2·r).
-     Results: `test_data_pc` vs `somas_pc.mat` 108 proposals, P 0.90 R 0.90 (0.92/0.92 without background removal) in ~3 s;
-     `test_asia` ch2 20 proposals, visually mostly on somas (without background removal: 50 blobs on the illumination gradient, Otsu fg 46%).
+     Gaussian 20 µm (background removal) → triangle threshold → per-slice fill of holes < π·r² (`remove_small_holes`) → opening with a 0.6·r ball
+     (done with distance transforms) → EDT peaks (min distance 1.2·r).
+     Threshold changed Otsu → triangle + small-hole fill on 2026-11-05 for MAP2 images (`new_asia_test`: nuclei are dim voids inside the somas;
+     Otsu kept 3% of the volume and only bright somas). Results (triangle / old Otsu): `test_data_pc` vs `somas_pc.mat` 113 proposals P 0.89 R 0.94
+     / 108, P 0.89 R 0.89 (CLAUDE.md earlier said 0.90/0.90), ~3 s; `test_asia` ch2 20 / 20 (without background removal: 50 blobs on the illumination
+     gradient, Otsu fg 46%); `new_asia_test` (z = 1 µm) 52 / 19, visually mostly on soma centres, a few double hits and neurite-junction hits.
+     Unbounded 2D `binary_fill_holes` gave the same counts but could fill neurite loops in dense cultures; hence the size limit.
+     `data/imgs/map2_asia_test.tif` (called `new_asia_test.tif` in the results above): ImageJ export of Fiji channel 2 of 5 (MAP2) of `IF_D14_ID_40x_3petri_middle_Ch2_`, 38×2048×2048 uint16,
+     0.1766 µm/px, voxel depth 1 µm (no .nd2 available). ImageJ omits `spacing=` when voxel depth is 1, so `tiff_preprocess` defaults to 1.0.
      Background σ 30 µm lets neurite beads in, 50 µm fails again. Napari display not tested here (no OpenGL); the layer object builds headless.
+     Multi-channel cell proposals (2026-11-05, only for multi-channel TIFFs): `load_or_detect_cells` caches `data/<stem>/auto_cells.npy` from
+     `detect_cells(channels, xy_res, z_res)`: DAPI nuclei (~0.5 µm XY grid, Otsu, seeds = maxima of DAPI smoothed 1.5 µm, watershed,
+     equiv. radius ≥ 2.5 µm) → per nucleus robust z-scores of MAP2 and F-actin in a 0.5–3 µm shell outside the nucleus and Ki67 inside →
+     neuron (MAP2 shell > 5) / astrocyte (else F-actin shell > 5) / other; Ki67+ if > 10. Rows `[z, y, x, r_um, class, ki67_pos, map2_shell,
+     actin_shell, ki67_in]`. Napari layers (2026-11-05, one colour each): `Neuron somas (proposed)` (yellow, neuron & Ki67−),
+     `Astrocyte somas (proposed)` (magenta, astrocyte & Ki67−), `Other nuclei (proposed)` (white, hidden, other & Ki67−),
+     `Proliferating (Ki67+) cells (proposed)` (cyan, every Ki67+ cell; hover `class` shows its MAP2/F-actin class). IF_D14: 61 / 25 / 84 / 37.
+     `self.cell_layers` keys 0 neuron, 1 astrocyte, 2 other, 3 proliferating; no accept button for 3 (Ki67+ cells are not accepted
+     as neurons or astrocytes; add one by hand in the neuron/astrocyte layer if it is one). The MAP2-only `Auto Somas` layer is then hidden. Like `auto_somas`, NOT saved as somas.
+     MAP2 shell/inside ratio was tried and dropped: in 3D the axial blur fills the nuclear void (inside ≈ shell). Thresholds 5/5/10 chosen by eye
+     on `IF_D14_ID_40x_3petri_middle_Ch2_` (MAP2 shell histogram: peak at 0 + long tail; Ki67 clearly bimodal, gap ~12). Result there:
+     207 nuclei = 80 neurons, 40 astrocytes, 87 other (mostly isolated nuclei with no stain around, plus small bright debris); 37 Ki67+,
+     of which 19 are "neurons" (suspicious, post-mitotic: progenitors or a neighbour's MAP2 in the shell). Judged visually only, no reference.
+     Known limits: dense DAPI clumps are partly under-segmented; a glial nucleus touching a neuron can pick up the neuron's MAP2 in its shell.
+     Reviewing proposals (2026-11-05): the class layers are plain editable Points layers (`self.cell_layers`, `out_of_slice_display=True`;
+     select/move/delete/add with napari's own tools in 2D; hand-added points get the median nucleus size). Dock "Cell Proposals":
+     `Accept neuron somas` copies the neuron layer into `Soma Centroids` with ellipsoids of `NEURON_SEED_FRACTION`=0.5 × the nucleus radius
+     (z radius = same µm / z_res), skips points inside existing somas, removes the layer; `Save Somas` then writes the usual files.
+     0.5 because `NeuronSeparator` uses soma-mask components as watershed seeds: full-size ellipsoids merged 80 neurons into 51 components.
+     `Accept astrocytes` writes `data/<stem>/astrocytes_data.npy` (`[z, y, x, r_um]`, pixel coords; re-press to re-save; reloaded instead of the
+     proposals on the next opening); nothing downstream reads it yet. `Discard other nuclei` removes that layer (auto_cells.npy kept).
+     `undo_soma` now removes the ellipses centred on the last soma's (y, x) (works for any size and after Load Somas).
+     Single-channel images (no `auto_cells`): the yellow `Auto Somas (proposed)` layer is `cell_layers[0]` (editable, slice-limited) and the
+     dock has only `Accept neuron somas` (seeds = 0.5 × the detect_somas radius). `open_viewer` tested with a stub viewer (Qt offscreen) on
+     `test_data_pc` and IF_D14 (multi-channel unchanged).
+     Slice display: napari's `out_of_slice_display` takes the point size in pixels (~75) as z extent, so every proposal showed on all
+     38 slices (seen in the user's screen recording). `_show_cells_near_slice` (on `dims.current_step`/`ndisplay` events) sets each layer's
+     `shown` mask to |z − slice| ≤ radius_um / z_res (median ~7 slices; IF_D14 mid-stack: 36/80 neurons shown, ends 4–8); all shown in 3D.
+     Tested headless with real layers and a stub viewer (edit → accept → duplicate guard → undo → save: 81 somas → 81 mask components);
+     the buttons/dock/editing in the real viewer were NOT run (no OpenGL).
    - `python NeuronalSomaMarker.py IMAGE.tif [-i init.json|mask.tif] [-r 10] [-z 3] [--batch]`
      (matplotlib) → `IMAGE_somas.json` + `IMAGE_somas_mask.tif` next to the image.
 2. Segmentation + separation: `test.py` is the working driver (`load_image` → `k_means_voxels`
    → `process_segmentation` → `NeuronSeparator.separate_neurons`). Writes `results/test_output/{seg,refined_seg}_{1,2}.pkl`.
    `run_segmentation.py` is stale (imports `neuron_segmentation`/`NeuronSegmentation` that don't exist; calls removed methods).
+2b. Multi-channel images (2026-11-05): `python segment_neurons.py data/<stem>/` reads `processed_image.npy` (soma channel = MAP2),
+   `processed_metadata.npy`, `soma_mask.tiff`; segmentation as `test.py` (size_lim [1024,1024,5], sigma 0) via `NeuronSegmenter.load_array`
+   (in-memory (Z,Y,X) stack; `load_image` now calls it); writes `neuron_segmentation.tiff` + `neuron_labels.tiff` ((Z,Y,X)), refuses to overwrite.
+   Seeds are grown inside the cell body (`NeuronSeparator`, `resolution=` given, `--soma-grow-um` 6) and, after the watershed, holes
+   enclosed by one neuron are filled per slice (≤ π(2·6 µm)², nuclei). Full run on IF_D14 (2026-11-05, before the hole fill was added):
+   segmentation 572 s, separation 265 s, 60 neurons from 60 seeds, median 1461 µm³ (5–95%: 209–3142); 75% of the MAP2 segmentation
+   assigned to a neuron (the rest is not connected to any accepted soma); 20/60 neurons still had nuclear holes in some slices (now fixed
+   in the code, outputs NOT regenerated). Crop vs full run over the same 512² region: 4.6% vs 4.5% segmented, Dice 0.85 (size_lim 512 vs 1024).
+   `python neuron_viewer.py data/<stem>/ [--dapi-tif MULTICHANNEL.tif]` → self-contained `neuron_viewer.html` (~8 MB): every slice at 2×
+   downsampling (labels by block max), max projection (`#projection` in the URL opens it), overlay opacity, DAPI toggle, soma centres,
+   hover id, click / table row isolates a neuron. Refuses to overwrite. Checked by rendering in headless Chrome (screenshots, DOM).
+   3D panel (WebGL, no library): labelled voxels on a ~0.7 µm XY grid (block max) as a point cloud, coloured per neuron, unassigned
+   segmentation in grey (toggle), z stretch / point size sliders, drag rotate, wheel zoom, shift-drag pan; selection synced with 2D.
+   Grid coarsened ×2 (XY and z) until ≤ `max_points` (1.5 M): Purkinje demo 7.5 M → 0.37 M points (87 → 11 MB). `--tag` reads tagged outputs.
 3. Network: `BSB_Compile.py`: `BSB_compile(somas_file='data/<stem>/somas_data.npy', output_file=..., data_path='data/<stem>/')`
    → `initialize_network(conn_strategy=None)` → `config_network` → `build_and_save` (`Scaffold.compile()`).
    `somas_file` is the napari `(z, y, x)` pixel array; it is converted to `(x, y, z)` µm using the metadata in `data_path`.
@@ -75,6 +133,11 @@ Pinned list: `data/vadis_requirements.txt`. Use `micromamba run -n vadis python 
 - `senpai_prune.py` uses `ndarray.ptp`, removed in NumPy 2 (fine with the pinned NumPy 1.26.4).
 
 ## Contracts — breaking these gives silently wrong results, not errors
+- **Channel order (default for all of Asia's images from now on, user decision 2026-11-05).** Fiji channel numbers (1-based, as in Fiji's
+  Split Channels / Duplicate; Python/nd2 index = Fiji number − 1): **1 = DAPI** (blue, all nuclei), **2 = MAP2** (green, neurons; nuclei are
+  dark voids inside MAP2 somas), **3 = F-actin** (red, neurons and astrocytes), **4 = Ki67** (grey, proliferating nuclei). The `IF_D14_*` stacks have
+  a 5th channel that looks like transmitted light / brightfield (checked on `IF_D14_ID_40x_3petri_middle_Ch2_`, all 5 MIPs consistent). `test_asia` (from `40X_F50M50_50M_Static_down_C3_001.nd2`) does NOT follow this order (its stored colours
+  suggest DAPI=1, grey punctate=2, green MAP2-like=3, red F-actin-like=4) and is set aside for multi-channel work.
 - **Axis order.** TIFF on disk and napari/`NeuronalSomaMarker.image`: `(Z, Y, X)`.
   `NeuronSegmenter.image_data` and all segmentation/separation arrays: `transpose(1, 2, 0)` → `(Y, X, Z)`,
   but the code names the first axis "x" and `image_info['dimensions'] = [X, Y, Z]`. This only works for
@@ -109,6 +172,39 @@ Pinned list: `data/vadis_requirements.txt`. Use `micromamba run -n vadis python 
   - Two-scale case: MATLAB ORs both levels into a single segmentation; Python refines each level separately (`refined_seg_1`, `refined_seg_2`).
   - Final refinement (2D opening, 3D closing) is kept on purpose (not in MATLAB); the single-scale MATLAB path has no min-area filter (only the two-scale path does).
   - Refinement loops (`binary_mask_1` voxel loops) are pure Python and slow (~2 min for 1024×1024×19).
+- `NeuronSeparator.separate_neurons` (changed 2026-11-05): watershed now on the whole image (outside seg = max) and multiplied by the
+  segmentation, as MATLAB `senpai_separator.m:32-39` (was `mask=senpai_seg`, which silently dropped seeds outside the segmentation:
+  crop test 15/20 neurons → 19/20). New `fill_soma_holes=True` (not in MATLAB): per z-slice, fill segmentation holes containing a seed,
+  then OR the seeds in (20/20). BUT on MAP2 (crop of IF_D14) it is not enough: the segmentation barely covers soma cytoplasm (fill
+  threshold 0.55·R = 2253 with R=4096, MAP2 soma cytoplasm ~600–1500; 'percentile' R=1881 → 1035 helps little), rings are open, and seeds in
+  the dark nucleus lose their own MAP2 ring to neighbours flooding through bright tissue: 13/20 "neurons" are ~only the seed.
+  Prototype (scratch, not in the code): grow the labelled seeds with `expand_labels` (6 µm, anisotropic spacing) restricted to the cell body
+  = per-slice grayscale-hole-filled smoothed MAP2 > Otsu, use them as markers and OR them into the segmentation: somas follow the cell
+  outline and keep their dendrites. Unrestricted growth (3–5 µm) gave artificial discs. 6 pairs of accepted somas lie < 7 µm apart in XY
+  (different z): probably one nucleus accepted twice; they split one neuron in two labels.
+- MAP2 labels soma + dendrites, not axons: morphologies from it have no axons (matters for VoxelIntersection connectivity).
+- Reconstruction on IF_D14 (viewer, max projection): somas + proximal dendrites are labelled; most long thin neurites stay unsegmented
+  (segmentation = 0.8% of the stack with test.py settings, sigma_gaussian=0, 6 clusters): morphologies are truncated. Unaccepted MAP2 somas
+  leave their MAP2 unassigned or attached to a neighbour. Many neurons span z 0–36 of 38 (axial blur + dendrites at different depths).
+  sigma_gaussian crop test (2026-11-05, IF_D14 dense crop (640,128) + sparse crop (1150,1100), 512² × 38, scratch only): neurites ARE
+  detected with [0] but beaded/fragmented (sparse: 84 connected pieces), and the separator's pruning drops pieces not connected to the
+  soma. [2] / [3] px (≈0.35 / 0.5 µm) make them continuous (48 / 28 pieces; seg 0.9% → 1.5% / 1.7% sparse, 4.5% → 7.2% / 9.1% dense)
+  with no more background voxels (smoothed MAP2 < median+3·MAD: ≤0.10 in all); [3] and [0,3] (OR, as MATLAB) merge neighbouring cells in
+  the dense cluster; [-1] (median) ≈ [0]. Candidate for 0.18 µm/px MAP2: [2]. Not adopted (default still [0], as test.py): ask first.
+  Full IF_D14 runs (2026-11-05, 61 somas, `--sigma 2` / `--sigma 0 3`, outputs tagged `_sigma2` / `_sigma0-3`; the untagged [0] outputs
+  were deleted at the user's request): [2] 15 min, [0,3] 28 min. Segmented 1.8 / 2.2% (was 0.8% with [0]); pieces 1713 / 1563 (2300);
+  background 4.0 / 4.1%; assigned to a neuron 85 / 87% (75%); median neuron 1805 / 1852 µm³; neurite volume >10 µm from soma 388 / 479 µm³;
+  reach 23.0 / 24.2 µm; skeleton 92.9 / 83.4 µm; Dice [2] vs [0,3] 0.84. Visually almost identical; [0,3] gives fuller, blobbier somas.
+  Recommended: `--sigma 2` (same result at half the time).
+- IF_D14 z calibration doubt: MAP2 intensity through somas stays above half-max over a median 28 of 38 µm (profile nearly flat), so neurons
+  are ~30 µm columns in 3D. Either strong axial blur or the z step is not 1 µm (ImageJ voxel depth 1 = also "uncalibrated"); to check in
+  the acquisition metadata before using z for morphology / BSB.
+- Duplicate accepted somas split one neuron into several labels (e.g. one isolated IF_D14 soma at ~(1500, 1250) px → 3 labels).
+- Purkinje demo (`data/test_data_pc/`, 2026-11-05; `data/imgs/test_data_pc.tif` is a symlink to the repo-root file): 113 detect_somas
+  proposals accepted as-is (102/113 inside a `somas_pc.mat` soma, 102/108 reference somas covered) → segmentation 20% of the stack,
+  113 neurons, median 27,500 µm³, 97% of the segmentation assigned. In this dense tissue the separation is a tessellation: dendrite
+  territories are split between neighbouring somas (molecular layer in stripes; one neuron gets a large dendritic region), and the 11 false
+  proposals also claim territory. No MATLAB parcellation of this demo exists to compare with.
 - `BSB_Compile.py`: `plot_network` calls `Scaffold.build`/`plot_3d`, which don't exist in bsb 6 (plotting needs the separate `bsb-plotting` package).
   A single `cell_type` and a single morphology are used for all somas; `cell_densities` is only used for random placement.
   Morphologies must be `.swc` in µm; the project has no SWC producer yet (`senpai_skeletonize.m` not ported).

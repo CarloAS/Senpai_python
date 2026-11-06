@@ -80,32 +80,32 @@ class NeuronSegmenter:
         with tifffile.TiffFile(full_path) as tif:
             # Get image dimensions and properties
             img_array = tif.asarray()
-            self.image_info['dimensions'] = [
-                img_array.shape[2],  # Nx
-                img_array.shape[1],  # Ny
-                img_array.shape[0]   # Nz
-            ]
-            bit = img_array.dtype
-            if bit == 'uint16': 
-                self.image_info['bit_depth'] = 16
-            elif bit == 'uint8':
-                self.image_info['bit_depth'] = 8
-            else:
-                raise ValueError('input image must be 8 or 16 bit')
-            
             # Extract resolution information
             self.extract_resolution_info(tif.pages[0].tags)
-            
-            # Set background threshold based on bit depth
-            self.image_info['intensity_ref'] = self.compute_intensity_reference(img_array)
-            print(f"intensity reference ({self.config.intensity_reference}): {self.image_info['intensity_ref']:.0f}")
-            if not self.config.background_threshold:
-                self.config.background_threshold = 0.02 * self.image_info['intensity_ref']
-            
-            self.image_info['dtype'] = img_array.dtype
-            self.image_data = img_array.transpose(1, 2, 0)
-            img = self.image_data
-            return img
+        return self.load_array(img_array, self.image_info['resolution'])
+
+    def load_array(self, img_array: np.ndarray, resolution) -> np.ndarray:
+        """Use an in-memory (Z, Y, X) uint8/uint16 stack (e.g. one channel of a multi-channel TIFF) as input.
+        resolution = (x, y, z) in um/pixel. Same steps as load_image after reading the file."""
+        self.image_info['dimensions'] = [img_array.shape[2], img_array.shape[1], img_array.shape[0]]  # Nx, Ny, Nz
+        if img_array.dtype == np.uint16:
+            self.image_info['bit_depth'] = 16
+        elif img_array.dtype == np.uint8:
+            self.image_info['bit_depth'] = 8
+        else:
+            raise ValueError('input image must be 8 or 16 bit')
+        self.image_info['resolution'] = tuple(resolution)
+
+        # Set background threshold based on bit depth
+        self.image_info['intensity_ref'] = self.compute_intensity_reference(img_array)
+        print(f"intensity reference ({self.config.intensity_reference}): {self.image_info['intensity_ref']:.0f}")
+        if not self.config.background_threshold:
+            self.config.background_threshold = 0.02 * self.image_info['intensity_ref']
+
+        self.image_info['dtype'] = img_array.dtype
+        self.image_data = img_array.transpose(1, 2, 0)
+        img = self.image_data
+        return img
 
     def compute_intensity_reference(self, img_array) -> float:
         """Reference intensity R used by the background (0.02*R) and soma-fill (0.55*R) thresholds."""
