@@ -13,9 +13,11 @@ from skimage.feature import peak_local_max
 from skimage.transform import downscale_local_mean
 from skimage.morphology import remove_small_holes
 
-# Default channel order of Asia's images (Fiji channel N = index N-1); extra channels are named ch<N>
-CHANNEL_NAMES = ['dapi', 'map2', 'actin', 'ki67']
-CHANNEL_COLORMAPS = {'dapi': 'blue', 'map2': 'green', 'actin': 'red', 'ki67': 'gray'}
+# Channel orders of Asia's stains (Fiji channel N = index N-1); extra channels are named ch<N>. The stain is taken from '_ID_' or
+# '_Mech_' anywhere in the file name (e.g. IF_D14_ID_40x_... / IF_D14_Mech_40x_...); any other name uses the ID order (CHANNEL_NAMES).
+CHANNEL_ORDERS = {'id': ['dapi', 'map2', 'actin', 'ki67'], 'mech': ['dapi', 'map2', 'piezo1', 'tuj1']}
+CHANNEL_NAMES = CHANNEL_ORDERS['id']
+CHANNEL_COLORMAPS = {'dapi': 'blue', 'map2': 'green', 'actin': 'red', 'ki67': 'gray', 'piezo1': 'red', 'tuj1': 'gray'}
 SOMA_CHANNEL = 'map2'  # channel used for soma detection in multi-channel TIFFs, unless -c is given
 CELL_CLASSES = ['neuron', 'astrocyte', 'other']  # class codes 0, 1, 2 of detect_cells
 # Accepted neuron ellipsoids = this fraction of the nucleus radius: they are watershed seeds (NeuronSeparator labels mask components),
@@ -56,6 +58,13 @@ def detect_somas(image, xy_res, z_res, radius_um=8.0, voxel_um=1.0, background_u
     order = np.argsort(-r)
     centres = (peaks[order] + 0.5) * np.array([fz, fxy, fxy]) - 0.5
     return np.column_stack([centres, r[order]])
+
+
+def channel_order_from_name(image_path):
+    """Channel names from '_ID_' or '_Mech_' in the file name (case-insensitive; CHANNEL_ORDERS); neither present: ID order."""
+    name = os.path.basename(image_path).lower()
+    stain = next((k for k in CHANNEL_ORDERS if f'_{k}_' in name), 'id')
+    return CHANNEL_ORDERS[stain]
 
 
 def detect_cells(channels, xy_res, z_res, voxel_um=0.5, background_um=20.0, min_radius_um=2.5, shell_um=(0.5, 3.0),
@@ -108,10 +117,11 @@ def detect_cells(channels, xy_res, z_res, voxel_um=0.5, background_um=20.0, min_
 
 
 class ImageProcessor:
-    def __init__(self, image_path = None, data_path='data/', channel=None):
-        
+    def __init__(self, image_path = None, data_path='data/', channel=None, channel_names=None):
+
         self.data_path = data_path
         self.channel = channel
+        self.channel_order = channel_names  # names of the TIFF channels in order (--channels); None: from the file name
         self.file_save = 'somas_data.npy'
         self.image_path = image_path
         self.channels = None  # {name: (Z, Y, X) array} for multi-channel TIFFs
@@ -213,7 +223,9 @@ class ImageProcessor:
         if 'C' in series.axes:
             # Hyperstack (Z, C, Y, X): keep every channel, use one of them (MAP2 by default) for the somas
             image_data = np.moveaxis(image_data, series.axes.index('C'), 0)
-            names = [CHANNEL_NAMES[c] if c < len(CHANNEL_NAMES) else f'ch{c + 1}' for c in range(len(image_data))]
+            # Only channels named 'actin' / 'ki67' are used as F-actin / Ki67 by detect_cells; other names are display-only
+            order = self.channel_order or channel_order_from_name(self.image_path)
+            names = [order[c] if c < len(order) else f'ch{c + 1}' for c in range(len(image_data))]
             self.channels = dict(zip(names, image_data))
             self.channel_names = names
             if self.channel is None:
@@ -561,6 +573,15 @@ def main():
         help="Channel index (0-based) used for the somas: required for .nd2; multi-channel .tif default: MAP2 (index 1)."
     )
     parser.add_argument(
+        "--channels",
+        type=lambda s: [n.strip().lower() for n in s.split(',')],
+        default=None,
+        help="Comma-separated channel names of a multi-channel .tif in Fiji order, e.g. dapi,map2,piezo1,tuj1 "
+             "(default from the file name: '_Mech_' in it -> dapi,map2,piezo1,tuj1; '_ID_' or neither -> "
+             "dapi,map2,actin,ki67). Needs 'dapi' and 'map2'; "
+             "only 'actin' / 'ki67' are used for the astrocyte / Ki67+ proposals."
+    )
+    parser.add_argument(
         "-d", "--data-path",
         type=str,
         default="data/",
@@ -574,7 +595,8 @@ def main():
         processor = ImageProcessor(
             image_path=args.image_path,
             data_path=args.data_path,
-            channel=args.channel
+            channel=args.channel,
+            channel_names=args.channels
         )
         # Start the annotation process
         

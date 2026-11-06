@@ -24,12 +24,49 @@ def _to_8bit(a, lo, hi):
     return (np.clip((a.astype(np.float32) - lo) / (hi - lo), 0, 1) * 255).astype(np.uint8)
 
 
+def _surface_cells(lab3):
+    """Cells of a (Z, Y, X) label grid with at least one 6-neighbour of another label (or outside the grid)."""
+    pad = np.pad(lab3, 1)
+    inner = np.ones(lab3.shape, bool)
+    for ax in range(3):
+        for d in (-1, 1):
+            inner &= np.roll(pad, d, axis=ax)[1:-1, 1:-1, 1:-1] == lab3
+    return (lab3 > 0) & ~inner
+
+
+def _shading(lab3, surface, grid, sigma_um=1.0, ao_um=3.0):
+    """Per surface cell (order of np.nonzero(surface)): outward normal of its own label, from the gradient of the label's mask
+    smoothed by sigma_um, in the viewer's frame (x right, y up = -row, z up = -slice), as uint8 (n + 1) * 127.5; and an
+    ambient-occlusion factor (uint8, 255 = open) from the fraction of labelled cells within ~ao_um (crevices, contacts darker)."""
+    from scipy import ndimage
+    normals = np.zeros(surface.shape + (3,), np.float32)
+    pad = int(np.ceil(3 * sigma_um / grid.min())) + 1
+    for k, box in enumerate(ndimage.find_objects(lab3), start=1):
+        if box is None:
+            continue
+        box = tuple(slice(max(0, b.start - pad), b.stop + pad) for b in box)
+        own = lab3[box] == k
+        smooth = ndimage.gaussian_filter(own.astype(np.float32), sigma_um / grid)
+        g = np.gradient(smooth, *grid)  # d/dz, d/dy, d/dx (um)
+        n = np.stack([-g[2], g[1], g[0]], -1)  # outward = -gradient; viewer y = -row, z = -slice
+        sel = own & surface[box]
+        normals[box][sel] = n[sel]
+    occ = ndimage.gaussian_filter((lab3 > 0).astype(np.float32), ao_um / grid)
+    n = normals[surface]
+    length = np.linalg.norm(n, axis=1, keepdims=True)
+    n = np.where(length > 1e-6, n / np.maximum(length, 1e-6), [0, 0, 1])  # isolated cell: facing up
+    ao = np.clip(1.25 - 1.4 * occ[surface], 0.3, 1.0)
+    return np.round((n + 1) * 127.5).astype(np.uint8), np.round(ao * 255).astype(np.uint8)
+
+
 def make_viewer(data_folder, out_html=None, downsample=2, dapi=None, tag='', voxel3d_um=0.7, max_points=1_500_000):
     """Write a self-contained HTML viewer of a separated stack. 2D: every z-slice of the soma channel (MAP2), optionally DAPI in
     blue, with neuron_labels.tiff as a coloured overlay; max-projection mode; hover = neuron id, click = isolate a neuron.
     3D (WebGL, no external library): every labelled voxel on a ~voxel3d_um XY grid (block maximum, all z), coloured per neuron,
-    plus the unassigned segmentation (neuron_segmentation<tag>.tiff, if present) in grey; synced with the 2D selection.
-    The 3D grid is made coarser (x2 in XY and z per step) until it has at most max_points points, to keep the page responsive.
+    plus the unassigned segmentation (neuron_segmentation<tag>.tiff, if present) in grey; synced with the 2D selection. Only the surface
+    cells of each label are drawn, lit with per-cell normals of the label's smoothed mask and darkened by ambient occlusion
+    (_shading); a 'shading' checkbox switches back to flat colours.
+    The 3D grid is made coarser (x2 in XY and z per step) until it has at most max_points surface points, to keep the page responsive.
     Reads <data_folder>/processed_image.npy, processed_metadata.npy, neuron_labels.tiff and somas_data.npy (if present).
     dapi: optional (Z, Y, X) array of the DAPI channel. 2D images are downsampled by `downsample` in XY (labels by block maximum).
     tag: file name tag of segment_neurons outputs (e.g. '_sigma2'): reads neuron_labels<tag>.tiff, writes neuron_viewer<tag>.html."""
@@ -92,14 +129,18 @@ def make_viewer(data_folder, out_html=None, downsample=2, dapi=None, tag='', vox
         lab3 = zmax(np.stack([_block_max(l, f3) for l in labels]))
         if seg is not None:
             lab3 = np.where((lab3 == 0) & (zmax(np.stack([_block_max(s, f3) for s in seg])) > 0), 65535, lab3)
-        if np.count_nonzero(lab3) <= max_points:
+        surface = _surface_cells(lab3)  # only the outer shell of each neuron is drawn (the inside is hidden)
+        if np.count_nonzero(surface) <= max_points:
             break
         f3, fz = f3 * 2, fz * 2
-    zz, yy, xx = np.nonzero(lab3)
+    grid = np.array([z_res * fz, xy * f3, xy * f3])  # um per 3D cell (z, y, x)
+    zz, yy, xx = np.nonzero(surface)
     ll = lab3[zz, yy, xx].astype(np.int64)
+    normals, ao = _shading(lab3, surface, grid)
     ll[ll == 65535] = 0
     points = np.column_stack([xx, yy, zz, ll]).astype('<u2')
     points3d = base64.b64encode(points.tobytes()).decode('ascii')
+    shade3d = base64.b64encode(np.column_stack([normals, ao]).astype(np.uint8).tobytes()).decode('ascii')
 
     somas = np.load(os.path.join(data_folder, 'somas_data.npy')) if os.path.exists(os.path.join(data_folder, 'somas_data.npy')) else np.empty((0, 3))
     info = {'name': meta.get('image_path', os.path.basename(os.path.normpath(data_folder))) + tag, 'shape': list(image.shape),
@@ -108,7 +149,7 @@ def make_viewer(data_folder, out_html=None, downsample=2, dapi=None, tag='', vox
             'grid3d': [xy * f3, xy * f3, z_res * fz]}
     html = (_TEMPLATE.replace('__INFO__', json.dumps(info)).replace('__NEURONS__', json.dumps(neurons))
             .replace('__SLICES__', json.dumps(slices)).replace('__PROJECTION__', json.dumps(projection))
-            .replace('__POINTS__', json.dumps(points3d)))
+            .replace('__POINTS__', json.dumps(points3d)).replace('__SHADE__', json.dumps(shade3d)))
     with open(out_html, 'w') as f:
         f.write(html)
     print(f"Saved {out_html} ({os.path.getsize(out_html) / 1e6:.1f} MB, {len(neurons)} neurons, {image.shape[0]} slices, "
@@ -153,13 +194,14 @@ button{background:var(--panel);color:var(--text);border:1px solid var(--line);bo
 <div class="controls"><label><input id="unas" type="checkbox"> unassigned segmentation (grey)</label>
 <label>point size <input id="psz" type="range" min="3" max="40" value="12"></label>
 <label>z stretch <input id="zst" type="range" min="5" max="30" value="10"></label>
+<label><input id="shade" type="checkbox" checked> shading</label>
 <button id="reset3">reset view</button></div>
 <div class="wrap" id="w3"><canvas id="c3"></canvas><div id="nogl">WebGL is not available in this browser.</div></div>
 <p class="hint">Drag to rotate, wheel to zoom, shift-drag to pan, double-click to reset. Starts seen from the top, like the slices.</p>
 </section></div>
 <div class="tablebox"><div id="count"></div><table><thead><tr><th>neuron</th><th>volume µm³</th><th>extent µm</th><th>z</th></tr></thead><tbody id="tb"></tbody></table></div></main>
 <script>
-const INFO=__INFO__, NEURONS=__NEURONS__, SLICES=__SLICES__, PROJ=__PROJECTION__, POINTS=__POINTS__;
+const INFO=__INFO__, NEURONS=__NEURONS__, SLICES=__SLICES__, PROJ=__PROJECTION__, POINTS=__POINTS__, SHADE=__SHADE__;
 const $=id=>document.getElementById(id), N=INFO.shape[1]/INFO.downsample|0;
 const color=k=>{const h=(k*137.508)%360;return `hsl(${h},85%,58%)`};
 const rgbOf=(()=>{const c=document.createElement('canvas').getContext('2d');const cache={};return k=>cache[k]||(c.fillStyle=color(k),c.fillRect(0,0,1,1),cache[k]=c.getImageData(0,0,1,1).data.slice(0,3))})();
@@ -217,13 +259,21 @@ if(!gl){$('nogl').style.display='flex'}else{
   const b=box[k]||(box[k]=[1e9,1e9,1e9,-1e9,-1e9,-1e9]);b[0]=Math.min(b[0],x);b[1]=Math.min(b[1],y);b[2]=Math.min(b[2],z);b[3]=Math.max(b[3],x);b[4]=Math.max(b[4],y);b[5]=Math.max(b[5],z)}
  const sh=(t,s)=>{const o=gl.createShader(t);gl.shaderSource(o,s);gl.compileShader(o);return o};
  const prog=gl.createProgram();
- gl.attachShader(prog,sh(gl.VERTEX_SHADER,`attribute vec3 p;attribute vec3 c;attribute float v;uniform mat4 m;uniform float ps,zs,dn,df;varying vec3 vc;
+ gl.attachShader(prog,sh(gl.VERTEX_SHADER,`attribute vec3 p;attribute vec3 c;attribute float v;attribute vec4 a;uniform mat4 m;uniform mat3 r;uniform float ps,zs,dn,df,sh;varying vec3 vc;
   void main(){if(v<.5){gl_Position=vec4(2.,2.,2.,1.);gl_PointSize=0.;return;}gl_Position=m*vec4(p.x,p.y,p.z*zs,1.);
-  gl_PointSize=max(1.5,ps/gl_Position.w);float d=clamp((gl_Position.w-dn)/(df-dn),0.,1.);vc=c*mix(1.15,.45,d);}`));
- gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,`precision mediump float;varying vec3 vc;void main(){vec2 q=gl_PointCoord-.5;if(dot(q,q)>.25)discard;gl_FragColor=vec4(vc,1.);}`));
+  gl_PointSize=max(1.5,ps/gl_Position.w);float d=clamp((gl_Position.w-dn)/(df-dn),0.,1.);
+  if(sh<.5){vc=c*mix(1.15,.45,d);return;}
+  vec3 n=a.xyz*2.-1.;n=normalize(r*vec3(n.x,n.y,n.z/zs));
+  vec3 L=normalize(vec3(-.45,.55,.7)),H=normalize(L+vec3(0.,0.,1.));
+  float df_=max(dot(n,L),0.)+.25*max(dot(n,-L),0.),sp=pow(max(dot(n,H),0.),28.);
+  vc=(c*(.28+.85*df_)*mix(.45,1.,a.w)+.35*sp*a.w)*mix(1.,.55,d);}`));
+ gl.attachShader(prog,sh(gl.FRAGMENT_SHADER,`precision mediump float;varying vec3 vc;void main(){vec2 q=gl_PointCoord-.5;float e=dot(q,q);if(e>.25)discard;gl_FragColor=vec4(vc*(1.-.9*e),1.);}`));
  gl.linkProgram(prog);gl.useProgram(prog);
  const buf=(data,name,size)=>{const b=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,b);gl.bufferData(gl.ARRAY_BUFFER,data,gl.STATIC_DRAW);const a=gl.getAttribLocation(prog,name);gl.enableVertexAttribArray(a);gl.vertexAttribPointer(a,size,gl.FLOAT,false,0,0);return b};
  buf(pos,'p',3);buf(col,'c',3);const vbuf=buf(vis,'v',1);
+ {const s=atob(SHADE),sb=new Uint8Array(s.length);for(let i=0;i<s.length;i++)sb[i]=s.charCodeAt(i);
+  const b=gl.createBuffer();gl.bindBuffer(gl.ARRAY_BUFFER,b);gl.bufferData(gl.ARRAY_BUFFER,sb,gl.STATIC_DRAW);
+  const a=gl.getAttribLocation(prog,'a');gl.enableVertexAttribArray(a);gl.vertexAttribPointer(a,4,gl.UNSIGNED_BYTE,true,0,0)}
  const U=n=>gl.getUniformLocation(prog,n);
  const mul=(a,b)=>{const o=new Float32Array(16);for(let i=0;i<4;i++)for(let j=0;j<4;j++){let s=0;for(let k=0;k<4;k++)s+=a[k*4+j]*b[i*4+k];o[i*4+j]=s}return o};
  const T=(x,y,z)=>new Float32Array([1,0,0,0,0,1,0,0,0,0,1,0,x,y,z,1]);
@@ -243,7 +293,9 @@ if(!gl){$('nogl').style.display='flex'}else{
   const zs=+$('zst').value/10, near=Math.max(0.1,dist-radius*3), far=dist+radius*3;
   const view=mul(T(pan[0],pan[1],-dist),mul(RX(pitch),mul(RY(yaw),T(-centre[0],-centre[1],-centre[2]))));
   gl.uniformMatrix4fv(U('m'),false,mul(persp(FOV,w/h,near,far),view));
-  gl.uniform1f(U('ps'),+$('psz').value/10*G[0]*h/(2*Math.tan(FOV/2)));gl.uniform1f(U('zs'),zs);gl.uniform1f(U('dn'),dist-radius);gl.uniform1f(U('df'),dist+radius);
+  const R=mul(RX(pitch),RY(yaw));gl.uniformMatrix3fv(U('r'),false,new Float32Array([R[0],R[1],R[2],R[4],R[5],R[6],R[8],R[9],R[10]]));
+  gl.uniform1f(U('sh'),$('shade').checked?1:0);
+  gl.uniform1f(U('ps'),+$('psz').value/10*Math.max(G[0],G[2]*zs)*h/(2*Math.tan(FOV/2)));gl.uniform1f(U('zs'),zs);gl.uniform1f(U('dn'),dist-radius);gl.uniform1f(U('df'),dist+radius);
   gl.drawArrays(gl.POINTS,0,NP);requestAnimationFrame(render)}
  let drag=null;
  c3.addEventListener('mousedown',e=>{drag={x:e.clientX,y:e.clientY,shift:e.shiftKey};c3.style.cursor='grabbing'});
@@ -252,7 +304,7 @@ if(!gl){$('nogl').style.display='flex'}else{
   if(drag.shift){const s=2*dist*Math.tan(FOV/2)/c3.clientHeight;pan[0]+=dx*s;pan[1]-=dy*s}else{yaw+=dx*0.01;pitch=Math.max(-3.1,Math.min(3.1,pitch+dy*0.01))}needs=true});
  c3.addEventListener('wheel',e=>{e.preventDefault();dist*=e.deltaY>0?1.1:1/1.1;needs=true},{passive:false});
  const reset=()=>{yaw=0;pitch=0;frame(sel);needs=true};c3.addEventListener('dblclick',reset);$('reset3').onclick=reset;
- $('unas').addEventListener('input',()=>update3d(false));$('psz').addEventListener('input',()=>needs=true);$('zst').addEventListener('input',()=>{frame(sel);needs=true});
+ $('unas').addEventListener('input',()=>update3d(false));$('psz').addEventListener('input',()=>needs=true);$('shade').addEventListener('input',()=>needs=true);$('zst').addEventListener('input',()=>{frame(sel);needs=true});
  window.addEventListener('resize',()=>needs=true);
  requestAnimationFrame(render)}
 draw();

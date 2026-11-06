@@ -28,6 +28,10 @@ class SegmentationConfig:
     #   int n        -> 2**n, the acquisition bit depth (e.g. 12 for a 12-bit camera stored as uint16; ND2: bitsPerComponentSignificant)
     #   'dtype'      -> 2**(8 or 16) from the storage type (behaviour before 2026-10-18)
     intensity_reference: Union[str, int] = 'max'
+    # z-consistent hole filling (not in MATLAB, which fills every enclosed hole): in the two per-slice (XY) hole fills of the
+    # refinement, a hole is filled only if at least this fraction of it is also filled in the slice above or below.
+    # Removes one-slice holes (e.g. a ring of neurites closing by chance around a gap between cells). None = MATLAB behaviour.
+    fill_z_support: Optional[float] = None
 
 def _sobel_derivative(vol, axis):
     """Equivalent of MATLAB imgradientxyz (Sobel, unnormalised, replicate padding) along one array axis."""
@@ -555,9 +559,10 @@ class NeuronSegmenter:
         refined_seg_1 = np.zeros_like(filled_seg_1, dtype=bool)
         
         # Process each slice
+        holes_filled_1 = self._fill_holes_xy(filled_seg_1)
         for z in range(filled_seg_1.shape[2]):
-            # Fill holes in 2D slice
-            slice_seg = ndimage.binary_fill_holes(filled_seg_1[:,:,z])
+            # Fill holes in 2D slice (z-consistent if config.fill_z_support)
+            slice_seg = holes_filled_1[:,:,z]
             
             # Additional intensity-based segmentation
             slice_intensity = original_image[:,:,z] > intensity_threshold
@@ -589,9 +594,10 @@ class NeuronSegmenter:
             # Additional segmentation refinement
             refined_seg_2 = np.zeros_like(filled_seg_2, dtype=bool)
             
+            holes_filled_2 = self._fill_holes_xy(filled_seg_2)
             for z in range(filled_seg_2.shape[2]):
-                # Fill holes in 2D slice
-                slice_seg = ndimage.binary_fill_holes(filled_seg_2[:,:,z])
+                # Fill holes in 2D slice (z-consistent if config.fill_z_support)
+                slice_seg = holes_filled_2[:,:,z]
                 
                 # Additional intensity-based segmentation
                 slice_intensity = original_image[:,:,z] > intensity_threshold
@@ -606,6 +612,31 @@ class NeuronSegmenter:
             refined_seg_2 = ndimage.binary_closing(refined_seg_2, structure=np.ones((3,3,3)))
         
         return refined_seg_1, refined_seg_2
+
+    def _fill_holes_xy(self, mask):
+        """Per z-slice binary_fill_holes of a (Y, X, Z) mask. With config.fill_z_support = f, a hole of slice z is filled only if
+        >= f of its pixels are filled (segmented or hole-filled) in slice z-1 or z+1; otherwise it is left empty."""
+        mask = np.asarray(mask, dtype=bool)
+        filled = np.stack([ndimage.binary_fill_holes(mask[:, :, z]) for z in range(mask.shape[2])], axis=2)
+        f = self.config.fill_z_support
+        if f is None:
+            return filled
+        out = mask.copy()
+        rejected = 0
+        for z in range(mask.shape[2]):
+            lab, n = ndimage.label(filled[:, :, z] & ~mask[:, :, z])
+            if n == 0:
+                continue
+            idx = np.arange(1, n + 1)
+            support = np.zeros(n)
+            for dz in (-1, 1):
+                if 0 <= z + dz < mask.shape[2]:
+                    support = np.maximum(support, ndimage.mean(filled[:, :, z + dz], lab, idx))
+            keep = np.r_[False, support >= f]
+            out[:, :, z] |= keep[lab]
+            rejected += int((lab > 0).sum() - keep[lab].sum())
+        print(f"z-consistent hole fill (support >= {f}): {rejected} hole voxels left empty")
+        return out
 
     def _remove_small_2d(self, slice_mask):
         """Drop 2D objects smaller than config.min_area pixels (MATLAB bwpropfilt 'Area' [7 inf], 8-connectivity)."""
@@ -640,11 +671,8 @@ class NeuronSegmenter:
         # Calculate intensity threshold
         threshold = 0.55 * intensity_ref
         
-        # Fill holes in each 2D slice along z-axis
-        for z in range(binary_image.shape[2]):
-            high_intensity_mask = (filled[:,:,z] == 0) & (original_image[:,:,z] > threshold)
-            combined_mask = filled[:,:,z] | high_intensity_mask
-            filled[:,:,z] = ndimage.binary_fill_holes(combined_mask)
+        # Fill holes in each 2D slice along z-axis (z-consistent if config.fill_z_support)
+        filled = self._fill_holes_xy(filled | (original_image > threshold))
         
         # Fill holes in each 2D slice along y-axis
         for y in range(binary_image.shape[1]):

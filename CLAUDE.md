@@ -19,7 +19,8 @@ Do not edit them. When changing a Python port, compare against its MATLAB source
 | `senpai_separator.m` | `NeuronSeparator.py` (`NeuronSeparator.separate_neurons`) | ported (imimposemin → watershed markers) |
 | `senpai_somamark.m` | `NeuronalSomaMarker.py` (current), `somamark.py` (older copy) | ported, matplotlib GUI |
 | `senpai_prune.m` | `senpai_prune.py` | draft: no imports, not runnable |
-| `senpai_estimateK.m`, `senpai_skeletonize.m`, `senpai_strahlerord.m`, `senpai_spinecatch.m` | none | not ported |
+| `senpai_skeletonize.m` | `NeuronSkeletonizer.py` | replaced (TEASAR instead of bwskel thinning, see Pipeline 2c) |
+| `senpai_estimateK.m`, `senpai_strahlerord.m`, `senpai_spinecatch.m` | none | not ported |
 
 ## Pipeline (run from the folder containing the data, all paths are relative to the working directory)
 0. Multi-channel ImageJ TIFFs (Z, C, Y, X, e.g. `data/imgs/IF_D14_ID_40x_3petri_middle_Ch2_.tif`, 5 channels) are read directly by
@@ -88,7 +89,13 @@ Do not edit them. When changing a Python port, compare against its MATLAB source
    → `process_segmentation` → `NeuronSeparator.separate_neurons`). Writes `results/test_output/{seg,refined_seg}_{1,2}.pkl`.
    `run_segmentation.py` is stale (imports `neuron_segmentation`/`NeuronSegmentation` that don't exist; calls removed methods).
 2b. Multi-channel images (2026-11-05): `python segment_neurons.py data/<stem>/` reads `processed_image.npy` (soma channel = MAP2),
-   `processed_metadata.npy`, `soma_mask.tiff`; segmentation as `test.py` (size_lim [1024,1024,5], sigma 0) via `NeuronSegmenter.load_array`
+   `processed_metadata.npy`, `soma_mask.tiff`; if the metadata `channel_names` contain `tuj1` (Mech stain) Tuj1 is read from the original TIFF
+   (`data_path/imgs/image_path`), segmented with the same settings and OR-ed with MAP2 (tag `_map2-tuj1`, e.g. `--tag _sigma2_map2-tuj1` for the viewer);
+   the separation still runs on MAP2. ID images: MAP2 only (2026-11-06). First run on `IF_D14_Mech_40x_up_Ch1_003` (`--sigma 2`, 130 accepted somas
+   → 128 seeds: 2 pairs touch): MAP2 1.6% of the stack (20 min), Tuj1 2.3% (17 min), union 2.8% (42% of it Tuj1-only), separation 12.5 min;
+   86% of the segmentation assigned; median neuron 2493 µm³ (5–95%: 681–6051); median z extent 37.5 of 62 slices. Viewer
+   `neuron_viewer_sigma2_map2-tuj1.html` (24 MB, rendered in headless Chrome): long Tuj1 neurites now attached to their somas; some bright
+   isolated neurites stay unassigned. Merging the channels before one segmentation (half the time) was discussed, not tried. segmentation as `test.py` (size_lim [1024,1024,5], sigma 0) via `NeuronSegmenter.load_array`
    (in-memory (Z,Y,X) stack; `load_image` now calls it); writes `neuron_segmentation.tiff` + `neuron_labels.tiff` ((Z,Y,X)), refuses to overwrite.
    Seeds are grown inside the cell body (`NeuronSeparator`, `resolution=` given, `--soma-grow-um` 6) and, after the watershed, holes
    enclosed by one neuron are filled per slice (≤ π(2·6 µm)², nuclei). Full run on IF_D14 (2026-11-05, before the hole fill was added):
@@ -100,7 +107,34 @@ Do not edit them. When changing a Python port, compare against its MATLAB source
    hover id, click / table row isolates a neuron. Refuses to overwrite. Checked by rendering in headless Chrome (screenshots, DOM).
    3D panel (WebGL, no library): labelled voxels on a ~0.7 µm XY grid (block max) as a point cloud, coloured per neuron, unassigned
    segmentation in grey (toggle), z stretch / point size sliders, drag rotate, wheel zoom, shift-drag pan; selection synced with 2D.
-   Grid coarsened ×2 (XY and z) until ≤ `max_points` (1.5 M): Purkinje demo 7.5 M → 0.37 M points (87 → 11 MB). `--tag` reads tagged outputs.
+   Shading (2026-11-06): only surface cells of each label are drawn, lit with normals of the label's smoothed mask (σ 1 µm) + ambient
+   occlusion (labelled fraction within 3 µm) + mild depth cue; point size covers max(XY cell, z cell × z stretch) (else stripes when tilted);
+   'shading' checkbox = old flat colours. Mech: 1.05 M → 0.48 M points (24 → 20.5 MB with DAPI). Checked by headless-Chrome screenshots.
+   Grid coarsened ×2 (XY and z) until ≤ `max_points` (1.5 M) surface points: Purkinje demo 7.5 M → 0.37 M points (87 → 11 MB). `--tag` reads tagged outputs.
+   K-means viewer (2026-11-06, `kmeans_viewer.py`): raw | k-means clusters | kept clusters (≥ block curvature threshold) | final segmentation,
+   per slice and channel, synced zoom, per-block cluster table (mean I, Gxx/Gyy/Gzz). `segment_neurons.py --save_kmeans` (new runs only) writes
+   `kmeans_<channel><tag>.tiff` ((Z,Y,X) uint8, level 1 only), `kmeans_blocks<tag>.json`, `kmeans_viewer<tag>.html` (2× downsampled).
+   `python kmeans_viewer.py data/<stem>/ --sigma 2 --tile Y0 X0 --z Z0 Z1` recomputes only some blocks (each block clustered independently,
+   random_state 42). Mech, tile (1024, 0), z 25–39: 6 blocks in ~2 min; kept clusters (MAP2 ∪ Tuj1) 98% inside the saved final segmentation, Dice 0.93.
+   Note: `segment_neurons` shares one `config` across channels, so Tuj1 uses MAP2's background threshold (0.02·R_map2); the viewer reproduces this.
+   z-consistent hole fill (2026-11-06, NOT in MATLAB, off by default): `SegmentationConfig.fill_z_support` / `segment_neurons.py --fill-z-support 0.5`
+   (tag `_zfill0.5`): in both per-slice XY fills of the refinement a hole is filled only if ≥ f of it is filled in z−1 or z+1. Motivation: Mech Tuj1
+   z 36 (y 1245, x 876): kept clusters closed a ring around a gap between cells (280 µm², Tuj1 median 1197 vs ring 1558, bg 924) and the fill
+   took it, one slice only. Default off = identical to HEAD (checked on a crop, both channels). Full Mech run `_sigma2_zfill0.5_map2-tuj1`
+   (with `--save_kmeans`, MAP2 20 min, Tuj1 23 min, separation 14 min): segmentation −1.8% (Dice 0.991 vs `_sigma2_map2-tuj1`, 133k voxels removed,
+   1 added; most at z 36), that box at z 36 23,370 → 14,945 px (neighbours ~15k), 128 neurons, labels unchanged where both labelled.
+   Soma centres were not filled by the segmentation in either version (soma bodies come from the separator's seed growth).
+2c. Morphologies (2026-11-06): `python NeuronSkeletonizer.py data/<stem>/ --tag <tag>` → `morphologies<tag>/neuron_<label>.swc` (µm, x = column,
+   y = row, z = slice; type 1 soma, 3 neurite; radius = distance to boundary) + `summary.csv`; refuses to overwrite; ~1 min for 128 neurons.
+   Same pre-steps as `senpai_skeletonize.m` (soma ∪ neuron, component of the soma, 3D fill, EDT, soma = one node at the seed centroid,
+   spur pruning), but the skeleton is TEASAR (penalised shortest paths from the deepest seed voxel, each new branch joins the tree at its
+   cheapest point, rolling ball 3·DBF + 1 µm, branches < 1.5 µm dropped, paths cut at the cell body = seed DBF radius), on an XY-binned grid
+   (~0.53 µm). Reason: skimage 0.25.2 3D `skeletonize` (Lee = bwskel) returns NOTHING for any even-square cross-section (2×2, 4×4, ... a
+   6×6×50 box → 0 voxels), so neurites break/vanish. Synthetic neuron test (scratch): soma, 40 µm neurite, 30 µm + Y fork, ring → stems 3,
+   fork found at the right place, length 165 µm. Mech `_sigma2_map2-tuj1` (128): length median 172 µm (5–95%: 33–511), 2–5 stems typical;
+   scale 1.5 gave 3× the branches (spurs in blobby cell bodies). Checked by overlays on label MIPs; bushy where neurites are thick/tufted;
+   no reference morphologies to compare with. BSB `parse_morphology_file` reads them (1 root, bounds = SWC in µm). `BSB_Compile` still takes
+   ONE `morph_file` for all cells (per-cell morphologies not wired in).
 3. Network: `BSB_Compile.py`: `BSB_compile(somas_file='data/<stem>/somas_data.npy', output_file=..., data_path='data/<stem>/')`
    → `initialize_network(conn_strategy=None)` → `config_network` → `build_and_save` (`Scaffold.compile()`).
    `somas_file` is the napari `(z, y, x)` pixel array; it is converted to `(x, y, z)` µm using the metadata in `data_path`.
@@ -136,7 +170,7 @@ Pinned list: `data/vadis_requirements.txt`. Use `micromamba run -n vadis python 
 - **Channel order (default for all of Asia's images from now on, user decision 2026-11-05).** Fiji channel numbers (1-based, as in Fiji's
   Split Channels / Duplicate; Python/nd2 index = Fiji number − 1): **1 = DAPI** (blue, all nuclei), **2 = MAP2** (green, neurons; nuclei are
   dark voids inside MAP2 somas), **3 = F-actin** (red, neurons and astrocytes), **4 = Ki67** (grey, proliferating nuclei). The `IF_D14_*` stacks have
-  a 5th channel that looks like transmitted light / brightfield (checked on `IF_D14_ID_40x_3petri_middle_Ch2_`, all 5 MIPs consistent). `test_asia` (from `40X_F50M50_50M_Static_down_C3_001.nd2`) does NOT follow this order (its stored colours
+  a 5th channel that looks like transmitted light / brightfield (checked on `IF_D14_ID_40x_3petri_middle_Ch2_`, all 5 MIPs consistent). Not every stain follows it: `IF_D14_Mech_40x_up_Ch1_003.tif` (62×5×2048², 0.1766 µm/px, no z spacing → 1 µm) is 1 DAPI, 2 MAP2, 3 Piezo1, 4 Tuj1, 5 brightfield: chosen automatically (2026-11-06, `channel_order_from_name`): `_Mech_` in the file name → `dapi,map2,piezo1,tuj1`; `_ID_` or neither → `dapi,map2,actin,ki67` (case-insensitive); `--channels a,b,c,...` overrides it for other stains. Only channels named `actin`/`ki67` feed the astrocyte/Ki67+ classes; with the default names Tuj1 was read as Ki67 (73 "Ki67+", 62 of them MAP2 neurons) and Piezo1 as F-actin. With `--channels`: 259 nuclei = 130 neurons, 129 other; names are saved in `processed_metadata.npy` (read by `segment_neurons.py`); `auto_cells.npy` is cached: delete it after changing names. `test_asia` (from `40X_F50M50_50M_Static_down_C3_001.nd2`) does NOT follow this order (its stored colours
   suggest DAPI=1, grey punctate=2, green MAP2-like=3, red F-actin-like=4) and is set aside for multi-channel work.
 - **Axis order.** TIFF on disk and napari/`NeuronalSomaMarker.image`: `(Z, Y, X)`.
   `NeuronSegmenter.image_data` and all segmentation/separation arrays: `transpose(1, 2, 0)` → `(Y, X, Z)`,
@@ -254,6 +288,12 @@ Pinned list: `data/vadis_requirements.txt`. Use `micromamba run -n vadis python 
   Contrast with `test_asia` (thin sparse neuronal marker, ch2): there the same classical methods fail; nuclear ch0 + DoG works (see above).
 - Cellpose lives in its own micromamba env `cellpose` (python 3.11, cellpose 4.2.1.1, torch 2.14.1, numpy 2.4.6; model weights ~1.15 GB in
   `~/.cellpose/models`). Do not install it into `vadis` (numpy 2 breaks bsb/numba/neo). Exchange data via .npy/.tif files.
+- Label-free soma benchmark (2026-11-06): `soma_benchmark/` = Zenodo 20797635 (Pal et al., oblique/Dodt, rat/mouse/human, CC-BY; md5-checked),
+  half kept by `prepare_dataset.py` (20/40 stacks per subset: authors' val+test = held-out, 10 seeded-random train = tuning; `kept_stacks.json`; 4.9 GB, zips deleted).
+  `soma_detection_benchmark.ipynb` (no outputs saved: `vadis` has no nbformat/nbconvert; figures/CSVs in `soma_benchmark/results/`, ~13 min):
+  point-in-mask matching, pixel units (no µm calibration in the data), radius/anisotropy from tuning GT, raw vs gradient input, stack bootstrap CIs,
+  permutation test vs random points. Result: `detect_somas` fails on relief contrast (held-out P 0.48, R 0.05, F1 0.09; 10× chance, p ≤ 0.001).
+  Says nothing about MAP2/DAPI accuracy; a fluorescence benchmark / hand-annotated IF_D14 subset is still needed.
 - Bit-depth thresholds, measured (`bg = 0.02·2^bit`, `fill = 0.55·2^bit`; MATLAB: bg=6000, fill=`0.55·2^ceil(log2(max))`):
   `test_asia` uint16 but max 4095: bg=1311 is 32% of max (only 0.5% of voxels pass), fill=36045 is never reached; MATLAB fill would be 2253.
   `test_data` uint8 max 255: bg=5, fill=141, fine. `test_neuron_1` uint16 max 65535: fine.
