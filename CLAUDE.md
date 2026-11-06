@@ -144,6 +144,26 @@ Do not edit them. When changing a Python port, compare against its MATLAB source
    switches the default connectivity to `VoxelIntersection` (tested with a synthetic SWC: 27 contacts for 15 cells).
    Smoke-tested on `data/test_asia` (15 cells placed, inside the network box, FixedIndegree 105 / AllToAll 225 connections).
    `bsb_test.py` / `bsb_test.ipynb` are scratch versions.
+3b. Simulation (2026-11-06): `BSB_IGNORE_PARALLEL=1 micromamba run -n vadis-nest python bsb_network.py data/<stem>/ --tag <tag>` →
+   `results/network/<stem><tag>/` (refuses to overwrite; ~30 s): two BSB networks of the same cells (SWC somas, µm):
+   *morph* = each cell its own soma-centred SWC (custom distributor `ByNearestSoma`, checked: all cells carry their own SWC) +
+   `VoxelIntersection` (voxels 500; autapses removed by `VoxelIntersectionNoAutapse`); *soma* = custom `DistanceDependent`, symmetric
+   Gaussian p(d) = p0·exp(−d²/2σ²), σ fitted (ML) to the morph network pairs, p0 set to match its connection count.
+   Mech `_sigma2_map2-tuj1`: 470 vs 468 connections, σ 28.1 µm, p0 0.71 (morph p ≈ 0.7 < 20 µm, 0.2 at 30–50, 0.05 at 50–80; exponential fit badly);
+   92% of morph connections reciprocal; 229/253 BSB pairs have skeletons within 3 µm (+radii) of each other (direct KD-tree check).
+   NEST (`bsb-nest`): `aeif_cond_alpha` (τ_syn_ex 2 ms, adaptation a 2 nS, b 80 pA, τw 500 ms), w_rec 8 nS, delay 1.5 ms, Poisson 2000 Hz × 1 nS
+   per cell (~2.6 Hz alone), 10 s, 5 repeats (input seeds; soma network re-drawn). iaf_cond_alpha without adaptation was bistable
+   (3.5 Hz at 1 nS, 100–300 Hz runaway from 1.5 nS). Result (Mech): network bursts ~1/s in both; morph: synchrony χ 0.51 ± 0.02 vs 0.47 ± 0.04,
+   cells per burst 0.76 ± 0.03 vs 0.62 ± 0.06, burst 111 vs 90 ms, spikes in bursts 0.79 vs 0.66, clustering 0.38 vs 0.31; bursts travel as
+   waves across x in the morph raster. Model choices (weights, adaptation, excitatory only) are not fitted to data.
+   `network_html.py` writes `network_activity.html` (Plotly 2.35.2 inlined from a cached copy `results/network/plotly-2.35.2.min.js`, works
+   offline; jsDelivr fallback): synced 3D replay (somas glow on spikes), rasters, population rate, bursts, comparison table, histograms.
+   Checked by headless-Chrome screenshot (no JS errors); the replay animation itself was not watched.
+3c. `presentation_stats.ipynb` (2026-11-06): ID vs Mech per image (auto-discovered in `data/`, group from `_ID_`/`_Mech_`): soma composition and
+   densities, segmentation %, unassigned %, neuron/neurite volumes, SWC length/branch points/tips/stems/reach/section length, Sholl, CDF, summary
+   table (Mann–Whitney on per-image values when ≥ 3 images per group). Cache `results/presentation/cache/`, figures PNG+PDF and CSVs in
+   `results/presentation/`. Astrocytes/Ki67 = not measured for Mech (no channel). Written as JSON (no nbformat in vadis); tested by running all
+   code cells as a script (8 s), not in Jupyter.
 4. Metadata exploration only: `extract_metadata.ipynb` (CZI/ImageJ/OME), `extract_channels.ipynb` (OME/ND2 channels).
 
 ## Scripts that overwrite existing results (always ask before running on an existing image/folder)
@@ -160,6 +180,9 @@ Pinned list: `data/vadis_requirements.txt`. Use `micromamba run -n vadis python 
 - matplotlib 3.10.9 (+ contourpy 1.3.3, cycler, fonttools, pyparsing) was installed on 2026-10-18 and added to `data/vadis_requirements.txt` (167 pins; `pip install --dry-run -r` on the env installs nothing).
   Careful: a plain `pip install matplotlib` upgrades numpy to 2.x and breaks bsb/numba/neo. Use
   `pip install "matplotlib<3.11" "contourpy<1.4" "numpy==1.26.4"`. `pip check` is clean with this set.
+- Env `vadis-nest` (2026-11-06, for NEST only; vadis untouched): conda-forge python 3.12, nest-simulator 3.9 (osx-arm64 builds all pull OpenMPI),
+  numpy 1.26.4; pip bsb-core/hdf5/json/yaml/nest 6.0.7 with `-c data/vadis_requirements.txt`. Plain `pip install bsb-nest` would install bsb-core 8 +
+  numpy 2.5. Quirk 3: in vadis-nest `import h5py` MUST precede `import nest`, else NEST segfaults on import (exit 139). Needs `BSB_IGNORE_PARALLEL=1`.
 - NOT installed: `aicspylibczi` (only `extract_metadata.ipynb`), `bsb-plotting`, `bsb-native`, StarDist/Cellpose. Installing needs the user's OK.
 - Quirk 1: `bsb` raises "MPI runtime detected" if ANY env var name contains "mpi". Inside VS Code,
   `VSCODE_NODE_COMPILE_CACHE_ROOT` ("co**mpi**le") triggers it: run with `env -u VSCODE_NODE_COMPILE_CACHE_ROOT` or set `BSB_IGNORE_PARALLEL=1`.
