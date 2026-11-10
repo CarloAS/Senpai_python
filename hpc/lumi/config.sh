@@ -6,6 +6,6 @@ LUMI_HOST=lumi.csc.fi
 SSH_KEY=$HOME/.ssh/id_lumi                     # key used by push.sh / pull.sh (rsync over ssh -i); Mac side only
 export RSYNC_RSH="ssh -i $SSH_KEY"
 
-CODE=/project/$PROJECT/$LUMI_USER/Senpai_python   # git clone of this repo
+CODE=/project/$PROJECT/Senpai_python             # git clone of this repo (shared project dir, not per-user)
 ENV=/project/$PROJECT/$LUMI_USER/envs/senpai      # container-wrapped Python env (setup_env.sh)
 WORK=/scratch/$PROJECT/$LUMI_USER/senpai          # run folder: data/, logs/ (scratch is purged: the Mac keeps the master copy)

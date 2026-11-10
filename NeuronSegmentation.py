@@ -228,7 +228,8 @@ class NeuronSegmenter:
 
         if self.config.n_jobs > 1:
             from joblib import Parallel, delayed  # joblib limits the BLAS/OpenMP threads of each worker
-            results = Parallel(n_jobs=self.config.n_jobs)(
+            # max_nbytes=None: no /dev/shm memmaps (on LUMI workers found the memmap file already deleted: BrokenProcessPool)
+            results = Parallel(n_jobs=self.config.n_jobs, max_nbytes=None)(
                 delayed(_process_block)(self.config, self.image_info['resolution'], self.th_back, voxel)
                 for voxel in voxels.values())
             for voxel, fields in zip(voxels.values(), results):
