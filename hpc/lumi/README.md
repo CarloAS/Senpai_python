@@ -12,7 +12,7 @@ All paths and the project number live in `config.sh`.
 1. **Mac**: fill in `PROJECT` and `LUMI_USER` in `hpc/lumi/config.sh`, commit, and push the branch to GitHub.
 2. **LUMI** (`ssh <user>@lumi.csc.fi`):
    ```bash
-   mkdir -p /project/<project>/<user> && cd /project/<project>/<user>
+   cd /project/<project>                          # code: shared project folder (CODE in config.sh); the env goes to /project/<project>/<user>/envs
    git clone -b bsb_implementation https://github.com/CarloAS/Senpai_python.git
    bash Senpai_python/hpc/lumi/setup_env.sh      # builds the container env (~10-20 min), creates $WORK/data and $WORK/logs
    ```
@@ -25,7 +25,7 @@ All paths and the project number live in `config.sh`.
 bash hpc/lumi/push.sh IF_D14_Mech_40x_up_Ch1_003 IF_D7_Mech_40x_Stat_Down_Ch1_001
 
 # LUMI
-cd /project/<project>/<user>/Senpai_python && git pull         # if the code changed
+cd /project/<project>/Senpai_python        && git pull         # if the code changed
 bash hpc/lumi/submit.sh                                         # one array task per manifest line
 squeue --me ; tail -f $WORK/logs/senpai_<jobid>_1.out
 seff <jobid>_1                                                  # peak memory / CPU efficiency after it ends

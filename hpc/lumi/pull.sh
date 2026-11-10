@@ -11,7 +11,7 @@ for stem in "$@"; do
     mkdir -p "data_lumi/$stem"
     rsync -e "$RSYNC_RSH" -avP --ignore-existing \
         --include='neuron_segmentation*.tiff' --include='neuron_labels*.tiff' \
-        --include='kmeans_*' --include='morphologies*/***' --exclude='*' \
+        --include='kmeans_*' --include='morphologies*/***' --include='processed_metadata.npy' --exclude='*' \
         "$LUMI_USER@$LUMI_HOST:$WORK/data/$stem/" "data_lumi/$stem/"
 done
 mkdir -p data_lumi/logs
