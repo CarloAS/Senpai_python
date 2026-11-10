@@ -2,4 +2,15 @@
 #   version map2       -> segment_neurons.py --sigma 2 --map2-only   (output tag _sigma2)
 #   version map2-tuj1  -> segment_neurons.py --sigma 2               (output tag _sigma2_map2-tuj1, Mech images only)
 # Lines starting with # are ignored. Edit before push.sh; submit.sh sets the array size from the non-comment lines.
+IF_D14_Mech_40x_up_Ch1_002	map2
+IF_D14_Mech_40x_up_Ch1_002	map2-tuj1
+IF_D14_Mech_40x_up_Ch1_003	map2
 IF_D14_Mech_40x_up_Ch1_003	map2-tuj1
+IF_D14_Mech_40x_up_Ch1_004	map2
+IF_D14_Mech_40x_up_Ch1_004	map2-tuj1
+IF_D7_Mech_40x_Stat_Down_Ch1_	map2
+IF_D7_Mech_40x_Stat_Down_Ch1_	map2-tuj1
+IF_D7_Mech_40x_Stat_Down_Ch1_001	map2
+IF_D7_Mech_40x_Stat_Down_Ch1_001	map2-tuj1
+IF_D7_Mech_40x_Stat_Down_Ch1_003	map2
+IF_D7_Mech_40x_Stat_Down_Ch1_003	map2-tuj1

@@ -22,6 +22,6 @@ for stem in "$@"; do
     echo "imgs/$img" >> "$list"
 done
 echo "Sending:"; sed 's/^/  data\//' "$list"
-rsync -avPL --files-from="$list" data/ "$LUMI_USER@$LUMI_HOST:$WORK/data/"
-rsync -avP "$(dirname "$0")/manifest.tsv" "$LUMI_USER@$LUMI_HOST:$WORK/manifest.tsv"
+rsync -e "$RSYNC_RSH" -avPL --files-from="$list" data/ "$LUMI_USER@$LUMI_HOST:$WORK/data/"
+rsync -e "$RSYNC_RSH" -avP "$(dirname "$0")/manifest.tsv" "$LUMI_USER@$LUMI_HOST:$WORK/manifest.tsv"
 rm -f "$list"

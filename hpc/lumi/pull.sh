@@ -9,10 +9,10 @@ source "$(dirname "$0")/config.sh"
 for stem in "$@"; do
     stem=${stem%/}; stem=${stem#data/}
     mkdir -p "data_lumi/$stem"
-    rsync -avP --ignore-existing \
+    rsync -e "$RSYNC_RSH" -avP --ignore-existing \
         --include='neuron_segmentation*.tiff' --include='neuron_labels*.tiff' \
         --include='kmeans_*' --include='morphologies*/***' --exclude='*' \
         "$LUMI_USER@$LUMI_HOST:$WORK/data/$stem/" "data_lumi/$stem/"
 done
 mkdir -p data_lumi/logs
-rsync -avP --ignore-existing "$LUMI_USER@$LUMI_HOST:$WORK/logs/" data_lumi/logs/
+rsync -e "$RSYNC_RSH" -avP --ignore-existing "$LUMI_USER@$LUMI_HOST:$WORK/logs/" data_lumi/logs/
