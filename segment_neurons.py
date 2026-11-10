@@ -39,7 +39,7 @@ def segment_channel(image, resolution, config, keep_kmeans=False):
 
 
 def segment_neurons(data_folder, size_lim=(1024, 1024, 5), sigma_gaussian=(0,), soma_grow_um=6.0, save_kmeans=False,
-                    fill_z_support=None):
+                    fill_z_support=None, map2_only=False):
     """Segment the neuronal channels of an image processed with Image_Processor.py and separate them into single neurons.
     Segmented channels: MAP2 (processed_image.npy); if the image has a 'tuj1' channel (Mech stain) also Tuj1, read from the original TIFF
     (<data_path>/imgs/<image_path> of the metadata), segmented separately with the same settings and OR-ed with MAP2 (file tag '_map2-tuj1').
@@ -53,10 +53,11 @@ def segment_neurons(data_folder, size_lim=(1024, 1024, 5), sigma_gaussian=(0,), 
     save_kmeans: also write the level-1 k-means labels of each segmented channel (kmeans_<channel><tag>.tiff, (Z, Y, X) uint8,
     0..clusters-1 by ascending intensity), their per-block stats/thresholds (kmeans_blocks<tag>.json) and the viewer
     kmeans_viewer<tag>.html (2x downsampled); needs a new segmentation (fails if neuron_segmentation<tag>.tiff exists).
-    fill_z_support: SegmentationConfig.fill_z_support (z-consistent hole filling, e.g. 0.5; None = MATLAB); adds '_zfill<f>' to the tag."""
+    fill_z_support: SegmentationConfig.fill_z_support (z-consistent hole filling, e.g. 0.5; None = MATLAB); adds '_zfill<f>' to the tag.
+    map2_only: segment MAP2 only even if the image has a Tuj1 channel (no '_map2-tuj1' in the tag), to measure Tuj1's contribution."""
     metadata = np.load(os.path.join(data_folder, 'processed_metadata.npy'), allow_pickle=True).item()
     names = metadata.get('channel_names') or []
-    extra = ['tuj1'] if 'tuj1' in names else []
+    extra = ['tuj1'] if 'tuj1' in names and not map2_only else []
     tag = sigma_tag(sigma_gaussian) + (f'_zfill{fill_z_support:g}' if fill_z_support is not None else '') + ''.join('_map2-' + n for n in extra)
     out_seg = os.path.join(data_folder, f'neuron_segmentation{tag}.tiff')
     out_lab = os.path.join(data_folder, f'neuron_labels{tag}.tiff')
@@ -144,9 +145,11 @@ def main():
     parser.add_argument("--fill-z-support", type=float, default=None,
                         help="z-consistent hole filling: fill a slice's hole only if >= this fraction of it is filled in an adjacent "
                              "slice (e.g. 0.5; default: off, MATLAB behaviour). Adds _zfill<f> to the output tag.")
+    parser.add_argument("--map2-only", action="store_true",
+                        help="Segment MAP2 only, even if the image has a Tuj1 channel (output tag without '_map2-tuj1').")
     args = parser.parse_args()
     segment_neurons(args.data_folder, sigma_gaussian=args.sigma, soma_grow_um=args.soma_grow_um, save_kmeans=args.save_kmeans,
-                    fill_z_support=args.fill_z_support)
+                    fill_z_support=args.fill_z_support, map2_only=args.map2_only)
 
 
 if __name__ == "__main__":

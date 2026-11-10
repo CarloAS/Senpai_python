@@ -99,10 +99,18 @@ class VoxelIntersectionNoAutapse(VoxelIntersection):
 
 
 # ---------------------------------------------------------------- inputs
+def swc_files(data_folder, tag):
+    return sorted(glob.glob(os.path.join(data_folder, f'morphologies{tag}', 'neuron_*.swc')), key=lambda f: int(os.path.basename(f)[7:-4]))
+
+
+def load_swcs(data_folder, tag):
+    """SWC arrays in the order of load_neurons (index = swc_index of network.npz)."""
+    return [np.loadtxt(f, comments='#', ndmin=2) for f in swc_files(data_folder, tag)]
+
+
 def load_neurons(data_folder, tag, out_dir):
     """Soma positions (um, x y z) and soma-centred copies of the SWC files (BSB morphologies are relative to the cell position)."""
-    files = sorted(glob.glob(os.path.join(data_folder, f'morphologies{tag}', 'neuron_*.swc')),
-                   key=lambda f: int(os.path.basename(f)[7:-4]))
+    files = swc_files(data_folder, tag)
     if not files:
         raise FileNotFoundError(f"no SWC files in {data_folder}morphologies{tag}/ (run NeuronSkeletonizer.py first)")
     cdir = os.path.join(out_dir, 'morphologies_centered')

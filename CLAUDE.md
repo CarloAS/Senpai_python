@@ -159,9 +159,27 @@ Do not edit them. When changing a Python port, compare against its MATLAB source
    `network_html.py` writes `network_activity.html` (Plotly 2.35.2 inlined from a cached copy `results/network/plotly-2.35.2.min.js`, works
    offline; jsDelivr fallback): synced 3D replay (somas glow on spikes), rasters, population rate, bursts, comparison table, histograms.
    Checked by headless-Chrome screenshot (no JS errors); the replay animation itself was not watched.
-3c. `presentation_stats.ipynb` (2026-11-06): ID vs Mech per image (auto-discovered in `data/`, group from `_ID_`/`_Mech_`): soma composition and
+   NaN statistics (e.g. `ibi_cv` with < 2 bursts) are written as null (`_finite`; crashed the HTML for Ch1_004 MAP2 before).
+   `python network_html.py results/network/<stem><tag>/ data/<stem>/` rebuilds the page from the saved outputs (no new simulation).
+3c. `presentation_stats.ipynb` (restructured 2026-11-07, user request): section 1 (somas) ID vs Mech; sections 2–4 Mech MAP2 (`_sigma2`) vs
+   MAP2 + Tuj1 (`_sigma2_map2-tuj1`), paired per image (lines, paired Wilcoxon: with 3 images min p = 0.25, + per-image ratio), outputs
+   `summary_soma_by_stain.csv`, `summary_by_version.csv`, `per_image_reconstruction.csv` (old `summary_by_group.csv` is stale); section 5 = paired
+   neurons + stain-matched ID; section 6 (fig11/fig12, `summary_network.csv`, `network_fits.csv`, `network_runs.csv`): soma-only vs morphology
+   network of the `_sigma2_map2-tuj1` runs (3 images). 3 Mech images: Tuj1 ratio segmented ×1.69, skeleton length ×1.51, neurite volume ×2.05;
+   network: rate/connections equal, cells per burst ×1.09/1.23/1.34 (morph > soma), χ and bursts/s not consistent. Ch1_004: 9 SWC soma nodes
+   differ between versions (labels without their seed, as Ch1_003 26/32).
+   Original description (2026-11-06): ID vs Mech per image (auto-discovered in `data/`, group from `_ID_`/`_Mech_`): soma composition and
    densities, segmentation %, unassigned %, neuron/neurite volumes, SWC length/branch points/tips/stems/reach/section length, Sholl, CDF, summary
-   table (Mann–Whitney on per-image values when ≥ 3 images per group). Cache `results/presentation/cache/`, figures PNG+PDF and CSVs in
+   table (Mann–Whitney on per-image values when ≥ 3 images per group).
+   Section 5 (2026-11-06): Tuj1 impact on Mech: `segment_neurons.py --map2-only` (new flag, tag `_sigma2`) + `NeuronSkeletonizer.py --tag _sigma2`
+   (MAP2 18 min, separation 11 min, 128 neurons). MAP2-only segmentation ⊂ union exactly (deterministic k-means); 99.1% of voxels labelled in
+   both keep the same label (label k = same soma). Tuj1 = 42% of the union segmentation (75% of it assigned); per neuron median 16% Tuj1-only,
+   volume ×1.11, skeleton length ×1.30. Stain-matched ID vs Mech (MAP2): segmented 1.77 / 1.64%, skeleton median 148 / 102 µm.
+   Ch1_002 / Ch1_004 (2026-11-07, 88 slices, 125 / 170 somas → 122 / 167 neurons), both versions, run one after the other
+   (`tmp/mech_runs/run_all.sh`, logs there): MAP2 ~21–27 min, Tuj1 ~22–27 min, separation 14–22 min per version. PEAK RAM 8.3–8.9 GB per
+   segment_neurons run: never run more than one at a time on this 16 GB Mac (4 in parallel → watchdog kernel panic + reboot on 2026-11-06).
+   k-means is not bit-reproducible between runs (Ch1_002 MAP2: 6,558,113 vs 6,558,153 voxels).
+   Labels 26 and 32 do not contain their soma seed (in one or both runs): SWC rooted at the thickest point (pre-existing, not fixed). Cache `results/presentation/cache/`, figures PNG+PDF and CSVs in
    `results/presentation/`. Astrocytes/Ki67 = not measured for Mech (no channel). Written as JSON (no nbformat in vadis); tested by running all
    code cells as a script (8 s), not in Jupyter.
 4. Metadata exploration only: `extract_metadata.ipynb` (CZI/ImageJ/OME), `extract_channels.ipynb` (OME/ND2 channels).

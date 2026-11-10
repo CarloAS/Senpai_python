@@ -78,6 +78,17 @@ def _conn_stats(pos, pairs, n):
             'indegree': C.sum(0).tolist(), 'distances': np.round(d, 1).tolist()}
 
 
+def _finite(v):
+    """Undefined statistics (NaN / inf, e.g. inter-burst CV with < 2 intervals) -> null in the page's JSON."""
+    if isinstance(v, dict):
+        return {k: _finite(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_finite(x) for x in v]
+    if isinstance(v, (float, np.floating)):
+        return float(v) if np.isfinite(v) else None
+    return v
+
+
 def write_html(path, summary, pos, swcs, conn_morph, conn_soma, spikes, duration):
     from bsb_network import detect_bursts
     n = len(pos)
@@ -93,7 +104,7 @@ def write_html(path, summary, pos, swcs, conn_morph, conn_soma, spikes, duration
     sx, sy, sz, sc = _skeleton_lines(swcs)
     data = {'n': n, 'duration': duration, 'pos': np.round(pos, 2).tolist(), 'nets': nets, 'summary': summary,
             'skeleton': {'x': sx, 'y': sy, 'z': sz, 'c': sc}, 'palette': PALETTE}
-    html = HTML.replace('__DATA__', json.dumps(data, separators=(',', ':'), allow_nan=False).replace('NaN', 'null'))
+    html = HTML.replace('__DATA__', json.dumps(_finite(data), separators=(',', ':'), allow_nan=False))
     html = html.replace('__TITLE__', f"Network activity · {summary['image']}").replace('__PLOTLY__', _plotly_tag())
     with open(path, 'w') as f:
         f.write(html)
@@ -235,3 +246,26 @@ hist('h_indeg','','In-degree','connections',k=>C[k].indegree);
 hist('h_dist','','Connection distance (soma to soma)','µm',k=>C[k].distances);
 </script></body></html>
 """
+
+
+def rebuild_html(out_dir, data_folder):
+    """Write network_activity.html again from the outputs saved by bsb_network.py (no new simulation)."""
+    path = os.path.join(out_dir, 'network_activity.html')
+    if os.path.exists(path):
+        raise FileExistsError(f"Not overwriting {path}")
+    summary = json.load(open(os.path.join(out_dir, 'summary.json')))
+    net, sp = np.load(os.path.join(out_dir, 'network.npz')), np.load(os.path.join(out_dir, 'spikes.npz'))
+    from bsb_network import load_swcs
+    swcs = load_swcs(data_folder, summary['tag'])
+    spikes = {k: (sp[f'{k}_t'], sp[f'{k}_s']) for k in ('morph', 'soma')}
+    write_html(path, summary, net['positions'], [swcs[k] for k in net['swc_index']], net['conn_morph'], net['conn_soma'],
+               spikes, summary['params']['duration'])
+
+
+if __name__ == '__main__':
+    import argparse
+    ap = argparse.ArgumentParser(description="Rebuild network_activity.html from a bsb_network.py output folder.")
+    ap.add_argument('out_dir', help='results/network/<stem><tag>/')
+    ap.add_argument('data_folder', help='data/<stem>/ (SWC files for the neurite display)')
+    a = ap.parse_args()
+    rebuild_html(a.out_dir, a.data_folder)
