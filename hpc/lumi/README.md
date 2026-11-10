@@ -44,10 +44,11 @@ No old outputs are sent, so the scripts' refuse-to-overwrite checks pass on LUMI
   with 16 GB peak footprint. Only the k-means part runs in parallel. The refinement and the watershed stay serial, so expect
   ~25-35 min per task. Check `seff` on the first run and lower `--mem`/`--time`.
 - Billing on `small`: memory above 2 GB/core is billed as extra cores (96 GB / 32 CPUs → ~48 core-h per hour).
-- Quick test first (debug partition, ≤ 30 min), e.g. with `test_data_pc` (37 MB):
+- Quick test first with `test_data_pc` (37 MB). On the Mac (4 workers), segmentation took 2 min and separation 3 min (113 neurons),
+  but skeletons took 49 min (dense, very large Purkinje cells; Mech images need ~1 min). That is too long for `debug` (30 min max):
   ```bash
   # manifest line: test_data_pc  map2
-  bash hpc/lumi/submit.sh --partition=debug --time=00:30:00 --mem=32G --cpus-per-task=16
+  bash hpc/lumi/submit.sh --time=01:30:00 --mem=32G --cpus-per-task=16
   ```
 
 ## Reproducibility
