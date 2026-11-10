@@ -1,0 +1,5 @@
+# One line = one array task: <stem> <TAB or spaces> <version>
+#   version map2       -> segment_neurons.py --sigma 2 --map2-only   (output tag _sigma2)
+#   version map2-tuj1  -> segment_neurons.py --sigma 2               (output tag _sigma2_map2-tuj1, Mech images only)
+# Lines starting with # are ignored. Edit before push.sh; submit.sh sets the array size from the non-comment lines.
+IF_D14_Mech_40x_up_Ch1_003	map2-tuj1

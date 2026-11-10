@@ -32,6 +32,9 @@ class SegmentationConfig:
     # refinement, a hole is filled only if at least this fraction of it is also filled in the slice above or below.
     # Removes one-slice holes (e.g. a ring of neurites closing by chance around a gap between cells). None = MATLAB behaviour.
     fill_z_support: Optional[float] = None
+    # Number of k-means blocks processed in parallel (joblib processes). 1 = serial loop as before. Each block keeps
+    # random_state=42, so the result does not depend on n_jobs beyond k-means floating-point noise.
+    n_jobs: int = 1
 
 def _sobel_derivative(vol, axis):
     """Equivalent of MATLAB imgradientxyz (Sobel, unnormalised, replicate padding) along one array axis."""
@@ -45,6 +48,22 @@ def _sobel_derivative(vol, axis):
 def second_derivatives(vol):
     """Gxx, Gyy, Gzz as in senpai_seg_core_v4.m: Sobel gradient of the Sobel gradient along each array axis."""
     return tuple(_sobel_derivative(_sobel_derivative(vol, ax), ax) for ax in range(3))
+
+
+_BLOCK_FIELDS = ('reshaped_cIMc', 'GxxKt', 'GyyKt', 'GzzKt', 'GxxKt_2', 'GyyKt_2', 'GzzKt_2', 'TOT_KM1', 'TOT_KM2')
+
+
+def _process_block(config, resolution, th_back, voxel):
+    """One k-means block for a joblib worker: the same three steps as the serial loop in k_means_voxels.
+    Builds a segmenter without the image, so only this block is sent to the worker."""
+    seg = NeuronSegmenter(config)
+    seg.image_info['resolution'] = resolution
+    seg.th_back = th_back
+    voxel = dict(voxel)
+    derivatives = seg.process_derivatives(voxel)
+    voxel = seg.reshape_voxel(voxel, derivatives)
+    voxel['TOT_KM1'], voxel['TOT_KM2'] = seg.kmeans_clustering(voxel, derivatives)
+    return {key: voxel[key] for key in _BLOCK_FIELDS}
 
 
 class NeuronSegmenter:
@@ -206,6 +225,15 @@ class NeuronSegmenter:
         """Perform k-means clustering on each voxel"""
         voxels = self.voxelize_image()
         sig_G = self.config.sigma_gaussian
+
+        if self.config.n_jobs > 1:
+            from joblib import Parallel, delayed  # joblib limits the BLAS/OpenMP threads of each worker
+            results = Parallel(n_jobs=self.config.n_jobs)(
+                delayed(_process_block)(self.config, self.image_info['resolution'], self.th_back, voxel)
+                for voxel in voxels.values())
+            for voxel, fields in zip(voxels.values(), results):
+                voxel.update(fields)
+            return voxels
 
         for voxel in voxels.values():
 

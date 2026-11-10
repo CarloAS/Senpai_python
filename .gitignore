@@ -7,3 +7,6 @@ vadis/
 matlab_senpai/
 tmp/
 __pycache__/
+.DS_Store
+*.pyc
+data_lumi/

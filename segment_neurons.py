@@ -39,7 +39,7 @@ def segment_channel(image, resolution, config, keep_kmeans=False):
 
 
 def segment_neurons(data_folder, size_lim=(1024, 1024, 5), sigma_gaussian=(0,), soma_grow_um=6.0, save_kmeans=False,
-                    fill_z_support=None, map2_only=False):
+                    fill_z_support=None, map2_only=False, n_jobs=1):
     """Segment the neuronal channels of an image processed with Image_Processor.py and separate them into single neurons.
     Segmented channels: MAP2 (processed_image.npy); if the image has a 'tuj1' channel (Mech stain) also Tuj1, read from the original TIFF
     (<data_path>/imgs/<image_path> of the metadata), segmented separately with the same settings and OR-ed with MAP2 (file tag '_map2-tuj1').
@@ -80,6 +80,7 @@ def segment_neurons(data_folder, size_lim=(1024, 1024, 5), sigma_gaussian=(0,), 
     config.size_lim = [min(size_lim[0], image.shape[2]), min(size_lim[1], image.shape[1]), size_lim[2]]
     config.sigma_gaussian = list(np.atleast_1d(sigma_gaussian))
     config.fill_z_support = fill_z_support
+    config.n_jobs = n_jobs
     resolution = (metadata['xy_res'], metadata['xy_res'], metadata['z_res'])
     segmenter = NeuronSegmenter(config)
     img = segmenter.load_array(image, resolution)  # MAP2 (Y, X, Z): separation image
@@ -147,9 +148,11 @@ def main():
                              "slice (e.g. 0.5; default: off, MATLAB behaviour). Adds _zfill<f> to the output tag.")
     parser.add_argument("--map2-only", action="store_true",
                         help="Segment MAP2 only, even if the image has a Tuj1 channel (output tag without '_map2-tuj1').")
+    parser.add_argument("--n-jobs", type=int, default=1,
+                        help="k-means blocks processed in parallel (default 1 = serial). Same output tag; e.g. the CPUs of a LUMI task.")
     args = parser.parse_args()
     segment_neurons(args.data_folder, sigma_gaussian=args.sigma, soma_grow_um=args.soma_grow_um, save_kmeans=args.save_kmeans,
-                    fill_z_support=args.fill_z_support, map2_only=args.map2_only)
+                    fill_z_support=args.fill_z_support, map2_only=args.map2_only, n_jobs=args.n_jobs)
 
 
 if __name__ == "__main__":
